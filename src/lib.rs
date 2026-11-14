@@ -575,18 +575,31 @@ pub fn parse_log_ts(line: &str) -> Option<chrono::NaiveDateTime> {
 }
 
 pub fn is_db_save_line(line: &str) -> bool {
-    line.contains("SaveDatabase - Database saved to disk") && line.contains("game.db")
+    // "...DB(game.db:0): SaveDatabase - Database saved to disk. Saving again in 60 seconds."
+    // Lines tagged with some other database (DB(other.db:0)) are ignored.
+    line.contains("SaveDatabase - Database saved to disk") && (line.contains("game.db") || !line.contains("DB("))
 }
 
-/// Timestamp of the most recent "Database saved to disk" line (looks at the last ~2 MB of the log).
+/// Timestamp of the most recent "Database saved to disk" line. Searches backwards from the end of the
+/// log in growing windows (2 MB, 8 MB, ... up to the whole file), so a chatty log can't hide it.
 pub fn last_db_save(log: &Path) -> Option<chrono::NaiveDateTime> {
     let mut f = fs::File::open(log).ok()?;
     let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(2_000_000))).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    text.lines().rev().find(|l| is_db_save_line(l)).and_then(parse_log_ts)
+    let mut size: u64 = 2_000_000;
+    loop {
+        let start = len.saturating_sub(size);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = Vec::with_capacity((len - start) as usize);
+        (&mut f).take(len - start).read_to_end(&mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        if let Some(ts) = text.lines().rev().filter(|l| is_db_save_line(l)).find_map(parse_log_ts) {
+            return Some(ts);
+        }
+        if start == 0 || size >= 512_000_000 {
+            return None;
+        }
+        size *= 4;
+    }
 }
 
 fn secs_between(now: chrono::NaiveDateTime, ts: chrono::NaiveDateTime) -> f64 {
@@ -663,11 +676,12 @@ pub fn safe_snapshot(
     let mut last_err = String::new();
     for attempt in 1..=3 {
         let deadline = Instant::now() + Duration::from_secs(150);
+        // Only wait if the log shows a database save 45..75 s ago. No such line at all -> nothing to wait for.
         let before = loop {
             match last_db_save(&log) {
-                None => progress("Waiting for the game's first database save…".into()),
+                None => break None,
                 Some(ts) => match timing_for_age(secs_since(ts)) {
-                    Timing::Safe => break ts,
+                    Timing::Safe => break Some(ts),
                     Timing::Wait(s) => progress(format!("Waiting for a safe moment to copy ({:.0} s)…", s)),
                 },
             }
@@ -678,7 +692,7 @@ pub fn safe_snapshot(
         };
         progress("Copying…".into());
         let r = take_snapshot(vault, name, live, cfg, note.clone(), shot.clone());
-        let landed = last_db_save(&log) != Some(before);
+        let landed = last_db_save(&log) != before;
         match r {
             Ok(m) if !landed && verify_db(&snap.join("data")).is_ok() => return Ok(m),
             Ok(_) => last_err = "the game saved while copying".into(),
@@ -692,36 +706,87 @@ pub fn safe_snapshot(
 
 // ───────────────────── screenshot of the running game window ─────────────────────
 
+/// PIDs of running DuneSandbox processes (Windows), from `tasklist`.
+#[cfg(windows)]
+fn game_pids() -> Vec<u32> {
+    let Ok(out) = quiet_cmd("tasklist").args(["/FO", "CSV", "/NH"]).output() else { return vec![] };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            // "DuneSandbox-Win64-Shipping.exe","12345","Console","1","1,234,567 K"
+            let mut it = l.split("\",\"");
+            let name = it.next()?.trim_matches('"').to_lowercase();
+            let pid = it.next()?.trim_matches('"').parse::<u32>().ok()?;
+            name.contains("dunesandbox").then_some(pid)
+        })
+        .collect()
+}
+
 /// Capture the Dune window (Windows only; uses Windows Graphics Capture, so it also works when the
 /// window is covered by another one, but not when minimized). Returns a temporary JPEG path.
+/// The error text says what was actually wrong.
 pub fn capture_game_shot() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
+        let pids = game_pids();
+        if pids.is_empty() {
+            return Err("no DuneSandbox process found".into());
+        }
+        let wins = xcap::Window::all().map_err(|e| format!("couldn't list windows: {e}"))?;
         let mut best: Option<(u64, xcap::Window)> = None;
-        for w in xcap::Window::all().map_err(|e| e.to_string())? {
-            if !w.app_name().unwrap_or_default().to_lowercase().contains("dunesandbox") {
-                continue;
-            }
-            if w.is_minimized().unwrap_or(false) {
+        let (mut minimized, mut tiny) = (0, 0);
+        let mut seen: Vec<String> = vec![];
+        for w in wins {
+            let pid = w.pid().unwrap_or(0);
+            // xcap's app_name() is the exe's FileDescription ("Dune: Awakening"), not the file name, so match by PID.
+            let by_pid = pids.contains(&pid);
+            let by_name = w.app_name().unwrap_or_default().to_lowercase().contains("dune");
+            if !by_pid && !by_name {
                 continue;
             }
             let (ww, hh) = (w.width().unwrap_or(0), w.height().unwrap_or(0));
-            if ww < 320 || hh < 200 {
+            seen.push(format!("'{}' {}x{}", w.title().unwrap_or_default(), ww, hh));
+            if w.is_minimized().unwrap_or(false) {
+                minimized += 1;
                 continue;
             }
-            let area = ww as u64 * hh as u64;
-            if best.as_ref().map_or(true, |(a, _)| area > *a) {
-                best = Some((area, w));
+            if ww < 320 || hh < 200 {
+                tiny += 1;
+                continue;
+            }
+            let score = ww as u64 * hh as u64 + if by_pid { 1 << 40 } else { 0 };
+            if best.as_ref().map_or(true, |(a, _)| score > *a) {
+                best = Some((score, w));
             }
         }
-        let (_, w) = best.ok_or("game window not found or minimized")?;
-        let frame = w.capture_image().map_err(|e| e.to_string())?;
+        let Some((_, w)) = best else {
+            return Err(if minimized > 0 {
+                "the game window is minimized (restore it, or use borderless/windowed mode)".into()
+            } else {
+                format!("no capturable game window (game pids {:?}; candidate windows: {}; too small: {})", pids, if seen.is_empty() { "none".into() } else { seen.join(", ") }, tiny)
+            });
+        };
+        let mut frame = None;
+        let mut last = String::new();
+        for _ in 0..3 {
+            match w.capture_image() {
+                Ok(f) => {
+                    frame = Some(f);
+                    break;
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+        let frame = frame.ok_or_else(|| format!("Windows Graphics Capture failed: {last} (the game may not be presenting frames while unfocused; try borderless/windowed mode)"))?;
         let (fw, fh) = (frame.width(), frame.height());
         let img = image::RgbaImage::from_raw(fw, fh, frame.into_raw()).ok_or("unexpected frame size")?;
         let brightness: u64 = img.pixels().step_by(97).map(|p| p.0[0].max(p.0[1]).max(p.0[2]) as u64).sum();
         let samples = (img.pixels().len() as u64 / 97).max(1);
         if brightness / samples < 6 {
-            return Err("the capture came back black (try borderless/windowed mode)".into());
+            return Err("the capture came back black (exclusive fullscreen can't be captured; use borderless/windowed mode)".into());
         }
         let rgb = image::DynamicImage::ImageRgba8(img).thumbnail(2560, 1440).to_rgb8();
         let path = std::env::temp_dir().join(format!("DuneSaveManager-shot-{}.jpg", std::process::id()));
@@ -740,7 +805,7 @@ pub fn auto_shot(max_age_hours: u64) -> (Shot, Option<PathBuf>, Option<String>) 
     if game_running() {
         match capture_game_shot() {
             Ok(p) => return (Shot::File(p.clone()), Some(p), None),
-            Err(e) => return (Shot::Auto(max_age_hours), None, Some(format!("Window capture failed: {e}. Using the newest Steam screenshot instead."))),
+            Err(e) => return (Shot::Auto(max_age_hours), None, Some(format!("Window capture failed: {e}"))),
         }
     }
     (Shot::Auto(max_age_hours), None, None)

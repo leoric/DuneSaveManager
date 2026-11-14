@@ -28,12 +28,14 @@ enum Pending {
 
 enum Msg {
     Status(String),
+    Warn(String),
     Done(Result<Meta, String>),
 }
 
 struct Job {
     rx: mpsc::Receiver<Msg>,
     status: String,
+    warn: Option<String>,
 }
 
 struct App {
@@ -194,7 +196,8 @@ impl App {
                 }
             };
             if let Some(w) = warn {
-                say(w);
+                let _ = tx.send(Msg::Warn(w.clone()));
+                say(format!("{w} - using the newest Steam screenshot instead."));
             }
             let mut progress = |s: String| say(s);
             let res = safe_snapshot(&vault, &name, &live, &cfg, note, shot, true, &mut progress).map_err(|e| e.to_string());
@@ -204,27 +207,30 @@ impl App {
             let _ = tx.send(Msg::Done(res));
             ctx2.request_repaint();
         });
-        self.job = Some(Job { rx, status: "Starting…".into() });
+        self.job = Some(Job { rx, status: "Starting…".into(), warn: None });
     }
 
     fn poll_job(&mut self) {
         let mut done = None;
+        let mut warn = None;
         if let Some(job) = self.job.as_mut() {
             while let Ok(m) = job.rx.try_recv() {
                 match m {
                     Msg::Status(s) => job.status = s,
+                    Msg::Warn(w) => job.warn = Some(w),
                     Msg::Done(r) => done = Some(r),
                 }
             }
         }
         let Some(r) = done else { return };
+        warn = warn.or_else(|| self.job.as_ref().and_then(|j| j.warn.clone()));
         self.job = None;
         match r {
             Ok(m) => {
                 let msg = if m.screenshot.is_some() || self.shot_mode == ShotMode::Off {
                     format!("Saved '{}'.", m.name)
                 } else {
-                    format!("Saved '{}' (no screenshot: the game window couldn't be captured and no recent Steam screenshot was found).", m.name)
+                    format!("Saved '{}' without a screenshot. {}; no recent Steam screenshot was found either.", m.name, warn.unwrap_or_else(|| "No screenshot source available".into()))
                 };
                 self.say(msg, false);
                 self.new_name.clear();

@@ -308,6 +308,99 @@ pub fn find_json_level(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
+// ───────────────── property-container decoder (character blobs) ─────────────────
+// Format (reverse-engineered by community editors): tag byte, hi nibble = length (or length-of-length),
+// lo nibble = type: 3 int, 5 float, 7 string, 8 long string (all decimal/UTF-8 text), 11 array, 12 struct,
+// 1/2 bool. Structs are key,value,key,value...; arrays are values.
+
+enum PNode {
+    Scalar(String),
+    Struct(Vec<(String, PNode)>),
+    Array(Vec<PNode>),
+}
+
+fn p_len(b: &[u8], i: &mut usize, hi: usize) -> Option<usize> {
+    Some(match hi {
+        0..=11 => hi,
+        12 => {
+            let v = *b.get(*i)? as usize;
+            *i += 1;
+            v
+        }
+        13 => {
+            let v = u16::from_be_bytes(b.get(*i..*i + 2)?.try_into().ok()?) as usize;
+            *i += 2;
+            v
+        }
+        14 => {
+            let v = u32::from_be_bytes(b.get(*i..*i + 4)?.try_into().ok()?) as usize;
+            *i += 4;
+            v
+        }
+        _ => return None,
+    })
+}
+
+fn p_decode(b: &[u8], i: &mut usize, depth: u32) -> Option<PNode> {
+    if depth > 64 {
+        return None;
+    }
+    let t = *b.get(*i)?;
+    *i += 1;
+    let (hi, lo) = ((t >> 4) as usize, t & 15);
+    match lo {
+        1 | 2 if hi == 0 => Some(PNode::Scalar(lo.to_string())),
+        3 | 5 | 7 | 8 => {
+            let n = p_len(b, i, hi)?;
+            let raw = b.get(*i..*i + n)?;
+            *i += n;
+            Some(PNode::Scalar(String::from_utf8_lossy(raw).into_owned()))
+        }
+        11 | 12 => {
+            let n = p_len(b, i, hi)?;
+            let end = i.checked_add(n)?;
+            if end > b.len() {
+                return None;
+            }
+            if lo == 12 {
+                let mut items = vec![];
+                while *i < end {
+                    let k = match p_decode(b, i, depth + 1)? {
+                        PNode::Scalar(k) => k,
+                        _ => return None,
+                    };
+                    items.push((k, p_decode(b, i, depth + 1)?));
+                }
+                Some(PNode::Struct(items))
+            } else {
+                let mut items = vec![];
+                while *i < end {
+                    items.push(p_decode(b, i, depth + 1)?);
+                }
+                Some(PNode::Array(items))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Root struct -> FLevelComponent (array, element [1] is a struct) -> TotalSkillPoints.
+pub fn total_skill_points(blob: &[u8]) -> Option<i64> {
+    let mut i = 0;
+    let root = p_decode(blob, &mut i, 0)?;
+    let PNode::Struct(items) = root else { return None };
+    let (_, lc) = items.into_iter().find(|(k, _)| k == "FLevelComponent")?;
+    let PNode::Array(mut a) = lc else { return None };
+    if a.len() < 2 {
+        return None;
+    }
+    let PNode::Struct(st) = a.swap_remove(1) else { return None };
+    match st.into_iter().find(|(k, _)| k == "TotalSkillPoints")?.1 {
+        PNode::Scalar(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// Best-effort extraction. Column names for the solo DB aren't publicly documented,
 /// so this is heuristic; use `probe` + `config name-sql / level-sql` to pin it down.
 pub fn inspect(profile_dir: &Path, cfg: &Config) -> Res<CharInfo> {
@@ -324,6 +417,39 @@ pub fn inspect(profile_dir: &Path, cfg: &Config) -> Res<CharInfo> {
         info.level_src = Some("custom SQL".into());
     }
 
+    // Exact path (verified by community save editors): the character's name lives in player_state,
+    // and its level is TotalSkillPoints + 1 inside the FLevelComponent blob of the pawn's
+    // "DuneCharacter" entity (fgl_entities.components).
+    if let Some((name, pawn)) = c
+        .query_row("SELECT character_name, player_pawn_id FROM player_state ORDER BY id LIMIT 1", [], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .ok()
+    {
+        if info.name.is_none() {
+            if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
+                info.name = Some(n);
+                info.name_src = Some("player_state.character_name".into());
+            }
+        }
+        if info.level.is_none() {
+            if let Some(pawn) = pawn {
+                let blob: Option<Vec<u8>> = c
+                    .query_row(
+                        "SELECT e.components FROM fgl_entities e JOIN actor_fgl_entities a ON a.entity_id = e.entity_id \
+                         WHERE a.actor_id = ?1 AND a.slot_name = 'DuneCharacter' LIMIT 1",
+                        [pawn],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(pts) = blob.as_deref().and_then(total_skill_points) {
+                    info.level = Some(pts + 1);
+                    info.level_src = Some("FLevelComponent.TotalSkillPoints + 1".into());
+                }
+            }
+        }
+    }
+
     let mut ts: Vec<(i32, String)> = tables(c).into_iter().map(|t| (table_score(&t), t)).filter(|(s, _)| *s > 0).collect();
     ts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     for (_, t) in &ts {
@@ -337,41 +463,6 @@ pub fn inspect(profile_dir: &Path, cfg: &Config) -> Res<CharInfo> {
                     info.name_src = Some(format!("{t}.{col}"));
                 }
             }
-        }
-        if info.level.is_none() {
-            if let Some(col) = pick(&["character_level", "char_level", "player_level", "playerlevel", "level", "lvl", "current_level"]) {
-                let sql = format!("SELECT {c} FROM {t} WHERE {c} IS NOT NULL LIMIT 1", c = qi(&col), t = qi(t));
-                if let Some(n) = first_value(c, &sql).and_then(v_int) {
-                    info.level = Some(n);
-                    info.level_src = Some(format!("{t}.{col}"));
-                }
-            }
-        }
-    }
-    // Fallback: any table with a column literally named like a level, value in a sane range.
-    if info.level.is_none() {
-        'outer: for t in tables(c) {
-            if table_score(&t) < 0 {
-                continue;
-            }
-            for col in columns(c, &t) {
-                let l = col.to_lowercase();
-                if l == "level" || l == "lvl" || l.ends_with("_level") || l.ends_with("level") && l.len() <= 16 {
-                    let sql = format!("SELECT {c} FROM {t} WHERE typeof({c}) IN ('integer','real') AND {c} BETWEEN 1 AND 200 ORDER BY {c} DESC LIMIT 1", c = qi(&col), t = qi(&t));
-                    if let Some(n) = first_value(c, &sql).and_then(v_int) {
-                        info.level = Some(n);
-                        info.level_src = Some(format!("{t}.{col} (guess)"));
-                        break 'outer;
-                    }
-                }
-            }
-        }
-    }
-    if info.level.is_none() {
-        let lj = profile_dir.join("SOLO").join("Level.json");
-        if let Some(n) = fs::read_to_string(&lj).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).and_then(|v| find_json_level(&v)) {
-            info.level = Some(n);
-            info.level_src = Some("SOLO/Level.json (unverified)".into());
         }
     }
     Ok(info)
@@ -522,7 +613,19 @@ pub enum Shot {
     File(PathBuf),
 }
 
+/// Small JPEG next to the screenshot, so the GUI never uploads a full 4K texture per card.
+pub fn ensure_thumb(snap: &Path, shot: &str) -> Option<PathBuf> {
+    let t = snap.join("thumb.jpg");
+    if t.exists() {
+        return Some(t);
+    }
+    let img = image::open(snap.join(shot)).ok()?;
+    img.thumbnail(560, 315).to_rgb8().save_with_format(&t, image::ImageFormat::Jpeg).ok()?;
+    Some(t)
+}
+
 pub fn attach_shot(snap: &Path, file: &Path) -> Res<String> {
+    let _ = fs::remove_file(snap.join("thumb.jpg"));
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
     for e in IMG_EXT {
         let _ = fs::remove_file(snap.join(format!("screenshot.{e}")));
@@ -667,4 +770,3 @@ pub fn open_path(p: &Path) {
         Command::new("xdg-open").arg(p).spawn()
     };
 }
-

@@ -48,6 +48,7 @@ struct App {
     probe_out: Option<String>,
     // game process
     running: Arc<AtomicBool>,
+    thumbs: std::collections::HashMap<String, PathBuf>,
     // cached so Settings doesn't hit the disk every frame
     cands: Vec<PathBuf>,
     profiles: Vec<String>,
@@ -85,6 +86,7 @@ impl App {
             attach_for: None,
             settings_open: false,
             probe_out: None,
+            thumbs: Default::default(),
             running: Arc::new(AtomicBool::new(false)),
             cands: vec![],
             profiles: vec![],
@@ -126,6 +128,14 @@ impl App {
         match vault_dir(&None, &self.cfg) {
             Ok(v) => {
                 self.metas = all_meta(&v);
+                self.thumbs.clear();
+                for m in &self.metas {
+                    if let Some(shot) = &m.screenshot {
+                        if let Some(t) = ensure_thumb(&v.join(&m.name), shot) {
+                            self.thumbs.insert(m.name.clone(), t);
+                        }
+                    }
+                }
                 self.vault = v;
             }
             Err(e) => self.say(e, true),
@@ -387,7 +397,8 @@ impl eframe::App for App {
                             ui.set_width(THUMB.x + 4.0);
                             match &m.screenshot {
                                 Some(s) => {
-                                    ui.add(egui::Image::new(img_uri(&self.vault.join(&m.name).join(s))).fit_to_exact_size(THUMB).rounding(4.0));
+                                    let shown = self.thumbs.get(&m.name).cloned().unwrap_or_else(|| self.vault.join(&m.name).join(s));
+                                    ui.add(egui::Image::new(img_uri(&shown)).fit_to_exact_size(THUMB).rounding(4.0));
                                 }
                                 None => {
                                     let (rect, _) = ui.allocate_exact_size(THUMB, Sense::hover());
@@ -490,6 +501,7 @@ impl eframe::App for App {
                     if let Ok(m) = read_meta(&self.vault, &name) {
                         if let Some(s) = m.screenshot {
                             ctx.forget_image(&img_uri(&self.vault.join(&name).join(s)));
+                            ctx.forget_image(&img_uri(&self.vault.join(&name).join("thumb.jpg")));
                         }
                     }
                     self.say(format!("Screenshot attached to '{name}'."), false);
@@ -577,6 +589,7 @@ impl eframe::App for App {
                     if ui.small_button("Save probe to file").clicked() {
                         if let Some(d) = dirs::data_local_dir() {
                             let f = d.join("DuneSaveManager").join("probe.txt");
+                            let _ = std::fs::create_dir_all(f.parent().unwrap());
                             if std::fs::write(&f, out).is_ok() {
                                 open_path(&f);
                             }

@@ -30,7 +30,8 @@ enum Cmd {
     Status,
     /// Snapshot the live save under a name
     Save {
-        name: String,
+        /// Snapshot name; omitted = "<character>-NN"
+        name: Option<String>,
         #[arg(short, long)]
         note: Option<String>,
         /// Attach this image instead of auto-picking a recent screenshot
@@ -187,14 +188,19 @@ fn run() -> Res<()> {
             }
         }
         Cmd::Save { name, note, screenshot, no_screenshot, max_age_hours, force } => {
+            let live = resolve_live(&cli, &cfg)?;
+            let vault = vault_dir(&cli, &cfg)?;
+            let name = match name {
+                Some(n) => n.trim().to_string(),
+                None => suggest_name(&vault, inspect(&live, &cfg).ok().and_then(|i| i.name).as_deref()),
+            };
+            let name = &name;
             if !valid_name(name) {
                 bail!("Name may only contain letters, digits, space, . _ -");
             }
             if name.starts_with("_auto-") {
                 bail!("'_auto-' is reserved for automatic backups");
             }
-            let live = resolve_live(&cli, &cfg)?;
-            let vault = vault_dir(&cli, &cfg)?;
             let mut tmp_shot: Option<std::path::PathBuf> = None;
             let shot = if *no_screenshot {
                 Shot::None

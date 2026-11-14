@@ -31,6 +31,10 @@ fn char_label(m: &Meta) -> String {
     m.character.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Unknown".into())
 }
 
+/// Default window width: left panel and margins (362) + exactly two cards (2 x 292) + their gap (10),
+/// plus ~2 px of slack for rounding on scaled displays. Narrower windows fall back to one column.
+const DEFAULT_WIDTH: f32 = 958.0;
+
 const THUMB: Vec2 = Vec2::new(280.0, 157.0);
 
 #[derive(PartialEq, Clone, Copy)]
@@ -43,6 +47,7 @@ enum ShotMode {
 enum Pending {
     Load(String),
     Delete(String),
+    DeleteAutos,
 }
 
 enum Msg {
@@ -187,8 +192,13 @@ impl App {
         self.live.as_ref().ok().cloned()
     }
 
+    fn auto_name(&self) -> String {
+        suggest_name(&self.vault, self.info.as_ref().and_then(|i| i.name.as_deref()))
+    }
+
     fn do_save(&mut self, ctx: &egui::Context) {
-        let name = self.new_name.trim().to_string();
+        let typed = self.new_name.trim().to_string();
+        let name = if typed.is_empty() { self.auto_name() } else { typed };
         if !valid_name(&name) {
             return self.say("Name may only contain letters, digits, spaces, . _ -", true);
         }
@@ -252,7 +262,10 @@ impl App {
                 let msg = if m.screenshot.is_some() || self.shot_mode == ShotMode::Off {
                     format!("Saved '{}'.", m.name)
                 } else {
-                    format!("Saved '{}' without a screenshot. {}; no recent Steam screenshot was found either.", m.name, warn.unwrap_or_else(|| "No screenshot source available".into()))
+                    match warn {
+                        Some(w) => format!("Saved '{}' without a screenshot. {w}; no recent Steam screenshot was found either.", m.name),
+                        None => format!("Saved '{}' without a screenshot (no recent Steam screenshot found).", m.name),
+                    }
                 };
                 self.say(msg, false);
                 self.new_name.clear();
@@ -284,6 +297,14 @@ impl App {
                     Err(e) => self.say(e, true),
                 }
             }
+            Pending::DeleteAutos => match delete_autosaves(&self.vault) {
+                Ok(n) => {
+                    self.say(format!("Deleted {n} automatic backup(s)."), false);
+                    self.refresh();
+                    ctx.request_repaint();
+                }
+                Err(e) => self.say(e, true),
+            },
             Pending::Delete(name) => match delete_snapshot(&self.vault, &name) {
                 Ok(()) => {
                     self.say(format!("Deleted '{name}'."), false);
@@ -421,8 +442,9 @@ impl eframe::App for App {
             ui.label(RichText::new("SAVE SNAPSHOT").strong().color(SAND));
             ui.group(|ui| {
                 ui.set_width(ui.available_width());
-                ui.label("Snapshot name");
-                let name_resp = ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text("e.g. atreides-run").desired_width(f32::INFINITY));
+                ui.label("Snapshot name (optional)");
+                let hint = format!("empty = {}", self.auto_name());
+                let name_resp = ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text(hint).desired_width(f32::INFINITY));
                 if name_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     enter_save = true;
                 }
@@ -457,7 +479,7 @@ impl eframe::App for App {
                     ShotMode::Off => {}
                 }
                 ui.add_space(8.0);
-                let ok = self.live.is_ok() && !self.new_name.trim().is_empty() && self.job.is_none();
+                let ok = self.live.is_ok() && self.job.is_none();
                 let btn = egui::Button::new(RichText::new("Save snapshot").size(17.0).strong().color(Color32::WHITE))
                     .fill(Color32::from_rgb(168, 112, 36))
                     .rounding(6.0)
@@ -467,7 +489,7 @@ impl eframe::App for App {
                     want_save = true;
                 }
                 if self.job.is_none() && !ok {
-                    ui.weak(if self.live.is_err() { "Live save not found - open Settings." } else { "Enter a name to enable saving." });
+                    ui.weak("Live save not found - open Settings.");
                 }
                 if let Some(job) = &self.job {
                     ui.horizontal(|ui| {
@@ -487,6 +509,7 @@ impl eframe::App for App {
         // ── central: snapshot cards
         let mut load: Option<String> = None;
         let mut del: Option<String> = None;
+        let mut del_autos = false;
         let mut attach: Option<String> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -494,6 +517,13 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.show_auto, "show automatic backups");
                 if ui.small_button("Open vault folder").clicked() {
                     open_path(&self.vault);
+                }
+                let n_auto = self.metas.iter().filter(|m| m.name.starts_with("_auto-")).count();
+                let del_btn = egui::Button::new(RichText::new(format!("Delete autosaves ({n_auto})")).color(Color32::WHITE).size(12.0))
+                    .fill(Color32::from_rgb(176, 48, 48))
+                    .small();
+                if ui.add_enabled(n_auto > 0, del_btn).on_disabled_hover_text("There are no automatic backups").clicked() {
+                    del_autos = true;
                 }
             });
             ui.separator();
@@ -597,6 +627,9 @@ impl eframe::App for App {
         if let Some(n) = load {
             self.pending = Some(Pending::Load(n));
         }
+        if del_autos {
+            self.pending = Some(Pending::DeleteAutos);
+        }
         if let Some(n) = del {
             self.pending = Some(Pending::Delete(n));
         }
@@ -610,6 +643,10 @@ impl eframe::App for App {
             let text = match p {
                 Pending::Load(n) => format!("Replace your live save with '{n}'?\nYour current save is backed up automatically first."),
                 Pending::Delete(n) => format!("Permanently delete snapshot '{n}'?"),
+                Pending::DeleteAutos => format!(
+                    "Permanently delete all {} automatic backups?\n(These are the copies made automatically before each load.)",
+                    self.metas.iter().filter(|m| m.name.starts_with("_auto-")).count()
+                ),
             };
             egui::Window::new("Confirm").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.label(text);
@@ -790,7 +827,7 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 740.0]).with_min_inner_size([800.0, 500.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([DEFAULT_WIDTH, 740.0]).with_min_inner_size([800.0, 500.0]),
         ..Default::default()
     };
     eframe::run_native(

@@ -1022,6 +1022,38 @@ pub fn load_snapshot(vault: &Path, name: &str, live: &Path, cfg: &Config) -> Res
     Ok(auto)
 }
 
+/// Default snapshot name: "<character>-NN" with the next free two-digit number (01, 02, ...).
+pub fn suggest_name(vault: &Path, character: Option<&str>) -> String {
+    let cleaned: String = character
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || " ._-".contains(c) { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ').to_string();
+    let base = if cleaned.is_empty() || cleaned.starts_with("_auto") { "save".to_string() } else { cleaned };
+    let prefix = format!("{}-", base.to_lowercase());
+    let max = subdirs(vault)
+        .iter()
+        .filter_map(|d| d.file_name().and_then(|n| n.to_str()).map(|n| n.to_lowercase()))
+        .filter_map(|n| n.strip_prefix(&prefix).and_then(|r| r.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(0);
+    format!("{base}-{:02}", max + 1)
+}
+
+/// Delete every automatic backup (`_auto-*`); returns how many were removed.
+pub fn delete_autosaves(vault: &Path) -> Res<usize> {
+    let mut n = 0;
+    for d in subdirs(vault) {
+        if d.file_name().and_then(|f| f.to_str()).map_or(false, |f| f.starts_with("_auto-")) {
+            fs::remove_dir_all(&d)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 pub fn delete_snapshot(vault: &Path, name: &str) -> Res<()> {
     read_meta(vault, name)?;
     fs::remove_dir_all(vault.join(name))?;

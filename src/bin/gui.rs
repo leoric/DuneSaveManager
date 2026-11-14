@@ -12,14 +12,13 @@ use std::{
 };
 
 const SAND: Color32 = Color32::from_rgb(224, 164, 88);
-/// Small "note" button drawn with the painter (no dependency on emoji fonts).
+/// Small "note" glyph (plain lines, not a button) drawn with the painter, so it needs no emoji font.
 fn note_icon(ui: &mut egui::Ui) -> egui::Response {
     let size = Vec2::splat(ui.spacing().interact_size.y);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let v = ui.style().interact(&resp);
-    ui.painter().rect(rect, v.rounding, v.weak_bg_fill, v.bg_stroke);
-    let r = rect.shrink(size.x * 0.27);
-    let stroke = egui::Stroke::new(1.5_f32, v.fg_stroke.color);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let color = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+    let r = rect.shrink(size.x * 0.2);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     for i in 0..4 {
         let y = r.top() + r.height() * (i as f32 / 3.0);
         let x2 = if i == 3 { r.center().x } else { r.right() };
@@ -543,20 +542,11 @@ impl eframe::App for App {
                                         del = Some(m.name.clone());
                                     }
                                     if let Some(note) = m.note.as_ref().filter(|t| !t.trim().is_empty()) {
-                                        let id = ui.make_persistent_id(("note", &m.name));
-                                        let mut r = note_icon(ui);
-                                        if !ui.memory(|mem| mem.is_popup_open(id)) {
-                                            r = r.on_hover_text("Show note");
-                                        }
-                                        if r.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(id));
-                                        }
-                                        egui::popup::popup_below_widget(ui, id, &r, |ui| {
-                                            ui.set_min_width(240.0);
-                                            ui.set_max_width(340.0);
-                                            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                                                ui.label(note);
-                                            });
+                                        // Hovering the glyph shows the note itself (long notes are wrapped and capped).
+                                        let text: String = if note.chars().count() > 1500 { note.chars().take(1500).collect::<String>() + "…" } else { note.clone() };
+                                        note_icon(ui).on_hover_ui(|ui| {
+                                            ui.set_max_width(360.0);
+                                            ui.label(text);
                                         });
                                     }
                                 });

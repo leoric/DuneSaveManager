@@ -12,6 +12,22 @@ use std::{
 };
 
 const SAND: Color32 = Color32::from_rgb(224, 164, 88);
+/// Small "note" button drawn with the painter (no dependency on emoji fonts).
+fn note_icon(ui: &mut egui::Ui) -> egui::Response {
+    let size = Vec2::splat(ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let v = ui.style().interact(&resp);
+    ui.painter().rect(rect, v.rounding, v.weak_bg_fill, v.bg_stroke);
+    let r = rect.shrink(size.x * 0.27);
+    let stroke = egui::Stroke::new(1.5_f32, v.fg_stroke.color);
+    for i in 0..4 {
+        let y = r.top() + r.height() * (i as f32 / 3.0);
+        let x2 = if i == 3 { r.center().x } else { r.right() };
+        ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(x2, y)], stroke);
+    }
+    resp
+}
+
 const THUMB: Vec2 = Vec2::new(280.0, 157.0);
 
 #[derive(PartialEq, Clone, Copy)]
@@ -356,7 +372,9 @@ impl eframe::App for App {
 
         // ── left: live save + save form
         let mut want_save = false;
+        let mut enter_save = false;
         egui::SidePanel::left("left").resizable(false).exact_width(330.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(6.0);
             ui.label(RichText::new("LIVE SAVE").strong().color(SAND));
             ui.group(|ui| {
@@ -397,10 +415,22 @@ impl eframe::App for App {
             ui.label(RichText::new("SAVE SNAPSHOT").strong().color(SAND));
             ui.group(|ui| {
                 ui.set_width(ui.available_width());
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text("e.g. atreides-run").desired_width(f32::INFINITY));
+                ui.label("Snapshot name");
+                let name_resp = ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text("e.g. atreides-run").desired_width(f32::INFINITY));
+                if name_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_save = true;
+                }
+                ui.add_space(4.0);
                 ui.label("Note (optional)");
-                ui.add(egui::TextEdit::singleline(&mut self.new_note).desired_width(f32::INFINITY));
+                egui::ScrollArea::vertical().id_source("note_scroll").max_height(130.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.new_note)
+                            .hint_text("Anything worth remembering about this save…")
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.add_space(4.0);
                 ui.label("Screenshot");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.shot_mode, ShotMode::Auto, "Auto");
@@ -420,10 +450,18 @@ impl eframe::App for App {
                     }
                     ShotMode::Off => {}
                 }
-                ui.add_space(4.0);
+                ui.add_space(8.0);
                 let ok = self.live.is_ok() && !self.new_name.trim().is_empty() && self.job.is_none();
-                if ui.add_enabled(ok, egui::Button::new("Save snapshot").min_size(Vec2::new(ui.available_width(), 28.0))).clicked() {
+                let btn = egui::Button::new(RichText::new("Save snapshot").size(17.0).strong().color(Color32::WHITE))
+                    .fill(Color32::from_rgb(168, 112, 36))
+                    .rounding(6.0)
+                    .min_size(Vec2::new(ui.available_width(), 38.0));
+                let clicked = ui.add_enabled(ok, btn).clicked();
+                if clicked || (enter_save && ok) {
                     want_save = true;
+                }
+                if self.job.is_none() && !ok {
+                    ui.weak(if self.live.is_err() { "Live save not found - open Settings." } else { "Enter a name to enable saving." });
                 }
                 if let Some(job) = &self.job {
                     ui.horizontal(|ui| {
@@ -433,6 +471,7 @@ impl eframe::App for App {
                 } else if running {
                     ui.weak("Game is running: the copy waits for a safe moment after the game's own database save (up to ~30 s).");
                 }
+            });
             });
         });
         if want_save {
@@ -457,44 +496,75 @@ impl eframe::App for App {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| ui.weak("No snapshots yet. Name your current character on the left and press Save."));
             }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for m in metas {
-                        ui.group(|ui| {
-                            ui.set_width(THUMB.x + 4.0);
-                            match &m.screenshot {
-                                Some(s) => {
-                                    let shown = self.thumbs.get(&m.name).cloned().unwrap_or_else(|| self.vault.join(&m.name).join(s));
-                                    ui.add(egui::Image::new(img_uri(&shown)).fit_to_exact_size(THUMB).rounding(4.0));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // Cards have a fixed width; work out how many fit per row and lay them out row by row
+                // (egui's wrapped layout does not wrap nested frames, so everything ended up in one row).
+                let frame = egui::Frame::group(ui.style());
+                let card_w = THUMB.x + frame.total_margin().sum().x;
+                let gap = 10.0;
+                ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                let cols = (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
+                for row in metas.chunks(cols) {
+                    ui.horizontal_top(|ui| {
+                        for m in row {
+                            frame.show(ui, |ui| {
+                              ui.vertical(|ui| {
+                                ui.set_width(THUMB.x);
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                                match &m.screenshot {
+                                    Some(s) => {
+                                        let shown = self.thumbs.get(&m.name).cloned().unwrap_or_else(|| self.vault.join(&m.name).join(s));
+                                        ui.add(egui::Image::new(img_uri(&shown)).fit_to_exact_size(THUMB).rounding(4.0));
+                                    }
+                                    None => {
+                                        let (rect, _) = ui.allocate_exact_size(THUMB, Sense::hover());
+                                        ui.painter().rect_filled(rect, 4.0, Color32::from_gray(24));
+                                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "no screenshot", FontId::proportional(13.0), Color32::GRAY);
+                                    }
                                 }
-                                None => {
-                                    let (rect, _) = ui.allocate_exact_size(THUMB, Sense::hover());
-                                    ui.painter().rect_filled(rect, 4.0, Color32::from_gray(24));
-                                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "no screenshot", FontId::proportional(13.0), Color32::GRAY);
-                                }
-                            }
-                            ui.label(RichText::new(&m.name).strong().size(16.0));
-                            let n = m.character.name.clone().unwrap_or("Unknown".into());
-                            let l = m.character.level.map(|x| x.to_string()).unwrap_or("?".into());
-                            ui.label(RichText::new(format!("{n}  -  Level {l}")).color(SAND));
-                            ui.weak(format!("{}  -  {}", m.created, mb(m.bytes)));
-                            if let Some(note) = &m.note {
-                                ui.label(RichText::new(note).italics());
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.add_enabled(!running, egui::Button::new("Load")).on_disabled_hover_text("Close the game first").clicked() {
-                                    load = Some(m.name.clone());
-                                }
-                                if ui.button("Screenshot").clicked() {
-                                    attach = Some(m.name.clone());
-                                }
-                                if ui.button("Delete").clicked() {
-                                    del = Some(m.name.clone());
-                                }
+                                // line 1: snapshot name
+                                ui.add(egui::Label::new(RichText::new(&m.name).strong().size(16.0)).truncate(true)).on_hover_text(&m.name);
+                                // line 2: character, level, date
+                                let n = m.character.name.clone().unwrap_or("Unknown".into());
+                                let l = m.character.level.map(|x| x.to_string()).unwrap_or("?".into());
+                                let mut job = egui::text::LayoutJob::default();
+                                job.append(&format!("{n}  ·  Lv {l}"), 0.0, egui::text::TextFormat { font_id: FontId::proportional(14.0), color: SAND, ..Default::default() });
+                                job.append(&format!("  ·  {}", m.created), 0.0, egui::text::TextFormat { font_id: FontId::proportional(13.0), color: Color32::GRAY, ..Default::default() });
+                                ui.add(egui::Label::new(job).truncate(true)).on_hover_text(format!("{n}, level {l}\nSaved {}  ({})", m.created, mb(m.bytes)));
+                                // line 3: buttons + note icon
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(!running, egui::Button::new("Load")).on_disabled_hover_text("Close the game first").clicked() {
+                                        load = Some(m.name.clone());
+                                    }
+                                    if ui.button("Screenshot").clicked() {
+                                        attach = Some(m.name.clone());
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        del = Some(m.name.clone());
+                                    }
+                                    if let Some(note) = m.note.as_ref().filter(|t| !t.trim().is_empty()) {
+                                        let id = ui.make_persistent_id(("note", &m.name));
+                                        let mut r = note_icon(ui);
+                                        if !ui.memory(|mem| mem.is_popup_open(id)) {
+                                            r = r.on_hover_text("Show note");
+                                        }
+                                        if r.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(id));
+                                        }
+                                        egui::popup::popup_below_widget(ui, id, &r, |ui| {
+                                            ui.set_min_width(240.0);
+                                            ui.set_max_width(340.0);
+                                            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                                                ui.label(note);
+                                            });
+                                        });
+                                    }
+                                });
+                              });
                             });
-                        });
-                    }
-                });
+                        }
+                    });
+                }
             });
         });
         if let Some(n) = load {

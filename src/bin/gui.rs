@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     time::Duration,
 };
@@ -24,6 +24,16 @@ enum ShotMode {
 enum Pending {
     Load(String),
     Delete(String),
+}
+
+enum Msg {
+    Status(String),
+    Done(Result<Meta, String>),
+}
+
+struct Job {
+    rx: mpsc::Receiver<Msg>,
+    status: String,
 }
 
 struct App {
@@ -49,6 +59,9 @@ struct App {
     // game process
     running: Arc<AtomicBool>,
     thumbs: std::collections::HashMap<String, PathBuf>,
+    job: Option<Job>,
+    log_edit: String,
+    log_found: Option<PathBuf>,
     // cached so Settings doesn't hit the disk every frame
     cands: Vec<PathBuf>,
     profiles: Vec<String>,
@@ -69,6 +82,7 @@ impl App {
             shots_edit: String::new(),
             name_sql: cfg.name_sql.clone().unwrap_or_default(),
             level_sql: cfg.level_sql.clone().unwrap_or_default(),
+            log_edit: cfg.log_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             cfg,
             live: Err("not loaded".into()),
             info: None,
@@ -87,6 +101,8 @@ impl App {
             settings_open: false,
             probe_out: None,
             thumbs: Default::default(),
+            job: None,
+            log_found: None,
             running: Arc::new(AtomicBool::new(false)),
             cands: vec![],
             profiles: vec![],
@@ -109,6 +125,7 @@ impl App {
     fn refresh_settings_cache(&mut self) {
         self.cands = fls_candidates();
         self.profiles = self.profile_choices();
+        self.log_found = self.live_path().and_then(|l| find_log(&l, &self.cfg));
     }
 
     fn say(&mut self, msg: impl ToString, err: bool) {
@@ -146,7 +163,7 @@ impl App {
         self.live.as_ref().ok().cloned()
     }
 
-    fn do_save(&mut self) {
+    fn do_save(&mut self, ctx: &egui::Context) {
         let name = self.new_name.trim().to_string();
         if !valid_name(&name) {
             return self.say("Name may only contain letters, digits, spaces, . _ -", true);
@@ -154,26 +171,60 @@ impl App {
         if name.starts_with("_auto-") {
             return self.say("'_auto-' is reserved for automatic backups", true);
         }
-        if game_running() {
-            return self.say("The game is running. Exit it first so the save isn't mid-write.", true);
-        }
         let Some(live) = self.live_path() else {
             return self.say("No live save found; open Settings.", true);
         };
-        let shot = match self.shot_mode {
-            ShotMode::Off => Shot::None,
-            ShotMode::Auto => Shot::Auto(self.max_age),
-            ShotMode::File => Shot::File(PathBuf::from(self.shot_file.trim())),
-        };
+        let (cfg, vault) = (self.cfg.clone(), self.vault.clone());
         let note = Some(self.new_note.trim().to_string()).filter(|s| !s.is_empty());
-        match take_snapshot(&self.vault, &name, &live, &self.cfg, note, shot) {
+        let (mode, max_age, shot_file) = (self.shot_mode, self.max_age, PathBuf::from(self.shot_file.trim()));
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let say = |s: String| {
+                let _ = tx.send(Msg::Status(s));
+                ctx2.request_repaint();
+            };
+            // Screenshot first, at the moment the user pressed Save.
+            let (shot, tmp, warn) = match mode {
+                ShotMode::Off => (Shot::None, None, None),
+                ShotMode::File => (Shot::File(shot_file), None, None),
+                ShotMode::Auto => {
+                    say("Taking screenshot…".into());
+                    auto_shot(max_age)
+                }
+            };
+            if let Some(w) = warn {
+                say(w);
+            }
+            let mut progress = |s: String| say(s);
+            let res = safe_snapshot(&vault, &name, &live, &cfg, note, shot, true, &mut progress).map_err(|e| e.to_string());
+            if let Some(t) = tmp {
+                let _ = std::fs::remove_file(t);
+            }
+            let _ = tx.send(Msg::Done(res));
+            ctx2.request_repaint();
+        });
+        self.job = Some(Job { rx, status: "Starting…".into() });
+    }
+
+    fn poll_job(&mut self) {
+        let mut done = None;
+        if let Some(job) = self.job.as_mut() {
+            while let Ok(m) = job.rx.try_recv() {
+                match m {
+                    Msg::Status(s) => job.status = s,
+                    Msg::Done(r) => done = Some(r),
+                }
+            }
+        }
+        let Some(r) = done else { return };
+        self.job = None;
+        match r {
             Ok(m) => {
-                let msg = if m.screenshot.is_some() {
-                    format!("Saved '{}'.", m.name)
-                } else if self.shot_mode == ShotMode::Off {
+                let msg = if m.screenshot.is_some() || self.shot_mode == ShotMode::Off {
                     format!("Saved '{}'.", m.name)
                 } else {
-                    format!("Saved '{}' (no recent screenshot found; press F12 in-game next time).", m.name)
+                    format!("Saved '{}' (no screenshot: the game window couldn't be captured and no recent Steam screenshot was found).", m.name)
                 };
                 self.say(msg, false);
                 self.new_name.clear();
@@ -224,6 +275,7 @@ impl App {
         }
         self.cfg.saves_root = new_saves;
         self.cfg.vault = t(&self.vault_edit).map(PathBuf::from);
+        self.cfg.log_path = t(&self.log_edit).map(PathBuf::from);
         self.cfg.name_sql = t(&self.name_sql);
         self.cfg.level_sql = t(&self.level_sql);
         if let Some(s) = t(&self.shots_edit) {
@@ -260,6 +312,7 @@ fn img_uri(p: &Path) -> String {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         let running = self.running.load(Ordering::Relaxed);
+        self.poll_job();
 
         // ── top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -274,7 +327,7 @@ impl eframe::App for App {
                         self.refresh();
                     }
                     let (c, t) = if running {
-                        (Color32::from_rgb(220, 80, 60), "Game running - close it to save/load")
+                        (Color32::from_rgb(220, 150, 60), "Game running - saving is timed to its DB save; loading is disabled")
                     } else {
                         (Color32::from_rgb(90, 190, 110), "Game closed")
                     };
@@ -344,7 +397,7 @@ impl eframe::App for App {
                 ui.add(egui::TextEdit::singleline(&mut self.new_note).desired_width(f32::INFINITY));
                 ui.label("Screenshot");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.shot_mode, ShotMode::Auto, "Newest");
+                    ui.selectable_value(&mut self.shot_mode, ShotMode::Auto, "Auto");
                     ui.selectable_value(&mut self.shot_mode, ShotMode::File, "Pick file");
                     ui.selectable_value(&mut self.shot_mode, ShotMode::Off, "None");
                 });
@@ -354,7 +407,7 @@ impl eframe::App for App {
                             ui.label("newer than");
                             ui.add(egui::DragValue::new(&mut self.max_age).clamp_range(1..=720).suffix(" h"));
                         });
-                        ui.weak("Uses your newest Steam (F12) screenshot.");
+                        ui.weak("Captures the game window now; otherwise uses your newest Steam (F12) screenshot.");
                     }
                     ShotMode::File => {
                         ui.add(egui::TextEdit::singleline(&mut self.shot_file).hint_text("path to image").desired_width(f32::INFINITY));
@@ -362,14 +415,22 @@ impl eframe::App for App {
                     ShotMode::Off => {}
                 }
                 ui.add_space(4.0);
-                let ok = self.live.is_ok() && !self.new_name.trim().is_empty();
+                let ok = self.live.is_ok() && !self.new_name.trim().is_empty() && self.job.is_none();
                 if ui.add_enabled(ok, egui::Button::new("Save snapshot").min_size(Vec2::new(ui.available_width(), 28.0))).clicked() {
                     want_save = true;
+                }
+                if let Some(job) = &self.job {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(&job.status);
+                    });
+                } else if running {
+                    ui.weak("Game is running: the copy waits for a safe moment after the game's own database save (up to ~30 s).");
                 }
             });
         });
         if want_save {
-            self.do_save();
+            self.do_save(ctx);
         }
 
         // ── central: snapshot cards
@@ -415,7 +476,7 @@ impl eframe::App for App {
                                 ui.label(RichText::new(note).italics());
                             }
                             ui.horizontal(|ui| {
-                                if ui.button("Load").clicked() {
+                                if ui.add_enabled(!running, egui::Button::new("Load")).on_disabled_hover_text("Close the game first").clicked() {
                                     load = Some(m.name.clone());
                                 }
                                 if ui.button("Screenshot").clicked() {
@@ -523,6 +584,7 @@ impl eframe::App for App {
             let mut pick_profile: Option<String> = None;
             let profiles = self.profiles.clone();
             let cands = self.cands.clone();
+            let log_found = self.log_found.clone();
             egui::Window::new("Settings").open(&mut open).default_width(560.0).vscroll(true).show(ctx, |ui| {
                 ui.label(RichText::new("Save location (default: Steam)").strong());
                 ui.label("The <steamid> folder containing game.db, or its FLS_retail parent. Leave blank to auto-detect.");
@@ -552,6 +614,13 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Vault (where snapshots are stored)").strong());
                 ui.add(egui::TextEdit::singleline(&mut self.vault_edit).hint_text("blank = default").desired_width(f32::INFINITY));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Game log (used to time saves while the game runs)").strong());
+                ui.add(egui::TextEdit::singleline(&mut self.log_edit).hint_text("blank = auto-detect Saved/Logs/DuneSandbox.log").desired_width(f32::INFINITY));
+                match &log_found {
+                    Some(p) => ui.weak(format!("Using: {}", p.display())),
+                    None => ui.weak("No log found yet (the game must have been started once)."),
+                };
                 ui.add_space(8.0);
                 ui.label(RichText::new("Extra screenshot folders").strong());
                 for d in self.cfg.screenshot_dirs.clone() {

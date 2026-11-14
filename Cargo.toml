@@ -17,6 +17,9 @@ eframe = { version = "=0.27.2", default-features = false, features = ["glow", "d
 egui_extras = { version = "=0.27.2", features = ["file", "image"] }
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
 
+[target.'cfg(windows)'.dependencies]
+xcap = { version = "0.9", default-features = false, features = ["wgc"] }
+
 [lib]
 name = "dune_save_manager"
 path = "src/lib.rs"

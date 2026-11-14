@@ -10,7 +10,7 @@ Two programs are built from this project:
 ## GUI
 
 * Left: the character currently in your live save (name, level, where they were read from), the game-running
-  indicator, and the *Save snapshot* form (name, note, screenshot: newest Steam screenshot / pick a file / none).
+  indicator, and the *Save snapshot* form (name, note, screenshot: automatic / pick a file / none).
 * Right: a card per snapshot with screenshot thumbnail, character, level, date, size and note,
   with **Load**, **Screenshot** and **Delete** buttons. Load asks for confirmation and backs up your live save first.
 * **Settings**: save location (auto-detected Steam path offered as a button; paste any other path), Steam account
@@ -51,7 +51,13 @@ DuneSaveManager load harkonnen              # live save is auto-backed-up first
 DuneSaveManager gallery --open              # HTML page with screenshots
 ```
 
-Close the game before `save` / `load` (it rewrites the save every ~20 s; `--force` overrides).
+**Saving while the game runs is supported.** The game writes `game.db` every 60 s and logs
+`SaveDatabase - Database saved to disk` in `%LOCALAPPDATA%\DuneSandbox\Saved\Logs\DuneSandbox.log`. `save` reads
+that log and only copies when the last database save was less than 45 s ago (or more than 75 s ago, i.e. saving has
+stalled); otherwise it waits. After copying it checks that no database save landed meanwhile and that the copy is a
+valid database, and retries if not. `--force` skips the waiting (risky). The log location can be set in Settings.
+
+**Loading requires the game to be closed**, always.
 
 ## Save location
 
@@ -70,6 +76,10 @@ DuneSaveManager config show
 Per-run overrides: `--saves <path>` and `--vault <path>`.
 
 ## Screenshots
+
+With the game running (Windows), *Automatic* captures the game window at the moment you press Save (borderless or
+windowed mode works best; a minimized window or exclusive fullscreen can't be captured). If that fails, or the game
+is closed, the newest Steam screenshot is used.
 
 `save` attaches the newest image from the last 24 h (`--max-age-hours N`) found in:
 Steam's screenshot folder for your account (press **F12** in-game), `%LOCALAPPDATA%\DuneSandbox\Saved\Screenshots`,

@@ -12,10 +12,11 @@ use rusqlite::{types::Value, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, SystemTime},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -39,6 +40,9 @@ pub struct Config {
     pub screenshot_dirs: Vec<PathBuf>,
     pub name_sql: Option<String>,
     pub level_sql: Option<String>,
+    /// Game log file (or its folder). Blank = auto-detect `Saved/Logs/DuneSandbox.log`.
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
 }
 
 pub fn config_path() -> Res<PathBuf> {
@@ -190,8 +194,12 @@ pub fn game_running() -> bool {
             .unwrap_or(false)
     } else if let Ok(rd) = fs::read_dir("/proc") {
         rd.filter_map(|e| e.ok()).any(|e| {
+            // Only look at the program itself (argv[0]), not at every argument of every process.
             fs::read(e.path().join("cmdline"))
-                .map(|b| String::from_utf8_lossy(&b).to_lowercase().contains("dunesandbox"))
+                .map(|b| {
+                    let arg0 = b.split(|c| *c == 0).next().unwrap_or(&[]);
+                    String::from_utf8_lossy(arg0).to_lowercase().contains("dunesandbox")
+                })
                 .unwrap_or(false)
         })
     } else {
@@ -222,7 +230,8 @@ impl TempDb {
             }
             out
         };
-        let path = std::env::temp_dir().join(format!("DuneSaveManager-{}.db", std::process::id()));
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("DuneSaveManager-{}-{}.db", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         fs::write(&path, raw)?;
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         Ok(TempDb { conn: Some(conn), path })
@@ -504,6 +513,239 @@ pub fn probe_text(profile_dir: &Path) -> Res<String> {
     Ok(o)
 }
 
+
+// ───────────────────── game log: when is it safe to copy? ─────────────────────
+// While the game runs it writes game.db every ~60 s and logs
+//   [2026.11.14-07.20.05:771]...LogLowLevelPersistence: Display: DB(game.db:0): SaveDatabase - Database saved to disk. Saving again in 60 seconds.
+// A copy is safe if the last logged save was < 45 s ago (the next one is still 15+ s away),
+// or > 75 s ago (saving has stalled). In between, wait.
+
+pub const SAFE_BEFORE: f64 = 45.0;
+pub const SAFE_AFTER: f64 = 75.0;
+
+pub fn log_dirs(live: &Path, cfg: &Config) -> Vec<PathBuf> {
+    let mut v = vec![];
+    if let Some(p) = &cfg.log_path {
+        v.push(p.clone());
+    }
+    for a in live.ancestors() {
+        if a.file_name().map_or(false, |n| n == "Saved") {
+            v.push(a.join("Logs"));
+        }
+    }
+    if let Some(l) = dirs::data_local_dir() {
+        v.push(l.join("DuneSandbox").join("Saved").join("Logs"));
+    }
+    v
+}
+
+pub fn find_log(live: &Path, cfg: &Config) -> Option<PathBuf> {
+    for d in log_dirs(live, cfg) {
+        if d.is_file() {
+            return Some(d);
+        }
+        let main = d.join("DuneSandbox.log");
+        if main.is_file() {
+            return Some(main);
+        }
+        let newest = fs::read_dir(&d).ok().and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |x| x == "log"))
+                .filter(|p| !p.file_name().map_or(false, |n| n.to_string_lossy().to_lowercase().contains("backup")))
+                .filter_map(|p| fs::metadata(&p).and_then(|m| m.modified()).ok().map(|t| (t, p)))
+                .max_by_key(|(t, _)| *t)
+                .map(|(_, p)| p)
+        });
+        if newest.is_some() {
+            return newest;
+        }
+    }
+    None
+}
+
+/// "[2026.11.14-07.20.05:771]..." -> timestamp
+pub fn parse_log_ts(line: &str) -> Option<chrono::NaiveDateTime> {
+    let s = line.trim_start().strip_prefix('[')?;
+    let ts = &s[..s.find(']')?];
+    let (main, ms) = ts.rsplit_once(':')?;
+    let dt = chrono::NaiveDateTime::parse_from_str(main, "%Y.%m.%d-%H.%M.%S").ok()?;
+    let ms: i64 = ms.trim().parse().ok()?;
+    Some(dt + chrono::Duration::milliseconds(ms))
+}
+
+pub fn is_db_save_line(line: &str) -> bool {
+    line.contains("SaveDatabase - Database saved to disk") && line.contains("game.db")
+}
+
+/// Timestamp of the most recent "Database saved to disk" line (looks at the last ~2 MB of the log).
+pub fn last_db_save(log: &Path) -> Option<chrono::NaiveDateTime> {
+    let mut f = fs::File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(2_000_000))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines().rev().find(|l| is_db_save_line(l)).and_then(parse_log_ts)
+}
+
+fn secs_between(now: chrono::NaiveDateTime, ts: chrono::NaiveDateTime) -> f64 {
+    (now - ts).num_milliseconds() as f64 / 1000.0
+}
+
+/// Seconds since `ts`. Unreal writes log timestamps in UTC; if that gives an implausible age,
+/// fall back to reading them as local time.
+pub fn secs_since(ts: chrono::NaiveDateTime) -> f64 {
+    let ok = |x: f64| (-5.0..=3600.0).contains(&x);
+    let utc = secs_between(chrono::Utc::now().naive_utc(), ts);
+    if ok(utc) {
+        return utc;
+    }
+    let local = secs_between(chrono::Local::now().naive_local(), ts);
+    if ok(local) {
+        local
+    } else {
+        utc
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Timing {
+    Safe,
+    Wait(f64),
+}
+
+pub fn timing_for_age(age: f64) -> Timing {
+    if age < SAFE_BEFORE || age > SAFE_AFTER {
+        Timing::Safe
+    } else {
+        Timing::Wait(SAFE_AFTER - age)
+    }
+}
+
+/// Decompress the copied game.db and run SQLite's quick_check (catches a torn copy).
+pub fn verify_db(profile_dir: &Path) -> Res<()> {
+    let db = TempDb::open(&profile_dir.join("game.db"))?;
+    let r: String = db.c().query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if r != "ok" {
+        bail!("database check failed: {r}");
+    }
+    Ok(())
+}
+
+/// Snapshot the live save. With the game closed it copies right away. With the game running it
+/// waits for a safe moment (see above), copies, then re-checks that no database save landed during
+/// the copy and that the copy is a valid database; otherwise it retries.
+/// `wait = false` skips the timing and copies immediately (CLI --force).
+pub fn safe_snapshot(
+    vault: &Path,
+    name: &str,
+    live: &Path,
+    cfg: &Config,
+    note: Option<String>,
+    shot: Shot,
+    wait: bool,
+    progress: &mut dyn FnMut(String),
+) -> Res<Meta> {
+    let snap = vault.join(name);
+    if snap.exists() {
+        bail!("Snapshot '{}' already exists (delete it first or pick another name)", name);
+    }
+    if !wait || !game_running() {
+        let m = take_snapshot(vault, name, live, cfg, note, shot)?;
+        if let Err(e) = verify_db(&snap.join("data")) {
+            let _ = fs::remove_dir_all(&snap);
+            bail!("Copied save failed verification: {e}");
+        }
+        return Ok(m);
+    }
+    let log = find_log(live, cfg).ok_or("The game is running but its log file wasn't found. Close the game, or set the log path in Settings.")?;
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let before = loop {
+            match last_db_save(&log) {
+                None => progress("Waiting for the game's first database save…".into()),
+                Some(ts) => match timing_for_age(secs_since(ts)) {
+                    Timing::Safe => break ts,
+                    Timing::Wait(s) => progress(format!("Waiting for a safe moment to copy ({:.0} s)…", s)),
+                },
+            }
+            if Instant::now() > deadline {
+                bail!("Timed out waiting for the game's database save. Is the game paused or still loading?");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        progress("Copying…".into());
+        let r = take_snapshot(vault, name, live, cfg, note.clone(), shot.clone());
+        let landed = last_db_save(&log) != Some(before);
+        match r {
+            Ok(m) if !landed && verify_db(&snap.join("data")).is_ok() => return Ok(m),
+            Ok(_) => last_err = "the game saved while copying".into(),
+            Err(e) => last_err = e.to_string(),
+        }
+        let _ = fs::remove_dir_all(&snap);
+        progress(format!("Copy was not clean ({last_err}); retrying ({attempt}/3)…"));
+    }
+    bail!("Couldn't get a clean copy after 3 tries ({last_err})")
+}
+
+// ───────────────────── screenshot of the running game window ─────────────────────
+
+/// Capture the Dune window (Windows only; uses Windows Graphics Capture, so it also works when the
+/// window is covered by another one, but not when minimized). Returns a temporary JPEG path.
+pub fn capture_game_shot() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let mut best: Option<(u64, xcap::Window)> = None;
+        for w in xcap::Window::all().map_err(|e| e.to_string())? {
+            if !w.app_name().unwrap_or_default().to_lowercase().contains("dunesandbox") {
+                continue;
+            }
+            if w.is_minimized().unwrap_or(false) {
+                continue;
+            }
+            let (ww, hh) = (w.width().unwrap_or(0), w.height().unwrap_or(0));
+            if ww < 320 || hh < 200 {
+                continue;
+            }
+            let area = ww as u64 * hh as u64;
+            if best.as_ref().map_or(true, |(a, _)| area > *a) {
+                best = Some((area, w));
+            }
+        }
+        let (_, w) = best.ok_or("game window not found or minimized")?;
+        let frame = w.capture_image().map_err(|e| e.to_string())?;
+        let (fw, fh) = (frame.width(), frame.height());
+        let img = image::RgbaImage::from_raw(fw, fh, frame.into_raw()).ok_or("unexpected frame size")?;
+        let brightness: u64 = img.pixels().step_by(97).map(|p| p.0[0].max(p.0[1]).max(p.0[2]) as u64).sum();
+        let samples = (img.pixels().len() as u64 / 97).max(1);
+        if brightness / samples < 6 {
+            return Err("the capture came back black (try borderless/windowed mode)".into());
+        }
+        let rgb = image::DynamicImage::ImageRgba8(img).thumbnail(2560, 1440).to_rgb8();
+        let path = std::env::temp_dir().join(format!("DuneSaveManager-shot-{}.jpg", std::process::id()));
+        rgb.save(&path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+    #[cfg(not(windows))]
+    {
+        Err("window capture is only available on Windows".into())
+    }
+}
+
+/// Screenshot choice for "automatic": the game window if it is running, else the newest Steam screenshot.
+/// Returns (shot, temp file to delete afterwards, message if the window capture failed).
+pub fn auto_shot(max_age_hours: u64) -> (Shot, Option<PathBuf>, Option<String>) {
+    if game_running() {
+        match capture_game_shot() {
+            Ok(p) => return (Shot::File(p.clone()), Some(p), None),
+            Err(e) => return (Shot::Auto(max_age_hours), None, Some(format!("Window capture failed: {e}. Using the newest Steam screenshot instead."))),
+        }
+    }
+    (Shot::Auto(max_age_hours), None, None)
+}
+
 // ───────────────────────── screenshots ─────────────────────────
 
 pub fn screenshot_dirs(profile_dir: &Path, cfg: &Config) -> Vec<PathBuf> {
@@ -607,6 +849,7 @@ pub fn clear_dir(dir: &Path) -> Res<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub enum Shot {
     None,
     Auto(u64),
@@ -640,18 +883,31 @@ pub fn take_snapshot(vault: &Path, name: &str, live: &Path, cfg: &Config, note: 
     if snap.exists() {
         bail!("Snapshot '{}' already exists (delete it first or pick another name)", name);
     }
-    let character = match inspect(live, cfg) {
+    fs::create_dir_all(&snap)?;
+    let bytes = match copy_dir(live, &snap.join("data")) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&snap);
+            return Err(e);
+        }
+    };
+    // Read name/level from the copy: the live game.db may be mid-write while the game runs.
+    let character = match inspect(&snap.join("data"), cfg) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("warning: couldn't read game.db ({e}); saving files anyway without character info");
+            eprintln!("warning: couldn't read game.db ({e}); saved files anyway without character info");
             CharInfo::default()
         }
     };
-    fs::create_dir_all(&snap)?;
-    let bytes = copy_dir(live, &snap.join("data"))?;
     let screenshot = match shot {
         Shot::None => None,
-        Shot::File(f) => Some(attach_shot(&snap, &f)?),
+        Shot::File(f) => match attach_shot(&snap, &f) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                let _ = fs::remove_dir_all(&snap);
+                return Err(e);
+            }
+        },
         Shot::Auto(h) => newest_screenshot(live, cfg, h).and_then(|f| attach_shot(&snap, &f).ok()),
     };
     let now = chrono::Local::now();
@@ -665,7 +921,10 @@ pub fn take_snapshot(vault: &Path, name: &str, live: &Path, cfg: &Config, note: 
         bytes,
         source_profile: live.file_name().map(|n| n.to_string_lossy().into()).unwrap_or_default(),
     };
-    fs::write(snap.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
+    if let Err(e) = fs::write(snap.join("meta.json"), serde_json::to_string_pretty(&meta)?) {
+        let _ = fs::remove_dir_all(&snap);
+        return Err(e.into());
+    }
     Ok(meta)
 }
 

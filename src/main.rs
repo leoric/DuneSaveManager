@@ -42,7 +42,8 @@ enum Cmd {
         /// Only auto-attach screenshots newer than this many hours
         #[arg(long, default_value_t = 24)]
         max_age_hours: u64,
-        /// Snapshot even if the game appears to be running
+        /// If the game is running, copy immediately instead of waiting for a safe moment after its
+        /// database save (risky: the copy may be torn)
         #[arg(long)]
         force: bool,
     },
@@ -59,8 +60,6 @@ enum Cmd {
         name: String,
         #[arg(short, long)]
         yes: bool,
-        #[arg(long)]
-        force: bool,
     },
     /// Delete a snapshot
     Delete {
@@ -194,19 +193,26 @@ fn run() -> Res<()> {
             if name.starts_with("_auto-") {
                 bail!("'_auto-' is reserved for automatic backups");
             }
-            if game_running() && !force {
-                bail!("The game appears to be running. Exit it first (it rewrites the save constantly) or use --force");
-            }
             let live = resolve_live(&cli, &cfg)?;
             let vault = vault_dir(&cli, &cfg)?;
+            let mut tmp_shot: Option<std::path::PathBuf> = None;
             let shot = if *no_screenshot {
                 Shot::None
             } else if let Some(f) = screenshot {
                 Shot::File(f.clone())
             } else {
-                Shot::Auto(*max_age_hours)
+                let (shot, tmp, warn) = auto_shot(*max_age_hours);
+                if let Some(w) = warn {
+                    println!("{w}");
+                }
+                tmp_shot = tmp;
+                shot
             };
-            let m = take_snapshot(&vault, name, &live, &cfg, note.clone(), shot)?;
+            let res = safe_snapshot(&vault, name, &live, &cfg, note.clone(), shot, !*force, &mut |s| println!("{s}"));
+            if let Some(t) = tmp_shot {
+                let _ = fs::remove_file(t);
+            }
+            let m = res?;
             let (n, l) = fmt_char(&m.character);
             println!("Saved '{}'  [{} | level {} | {}]", m.name, n, l, mb(m.bytes));
             match &m.screenshot {
@@ -245,11 +251,11 @@ fn run() -> Res<()> {
                 println!("Screenshot: {}", vault.join(&m.name).join(s).display());
             }
         }
-        Cmd::Load { name, yes, force } => {
+        Cmd::Load { name, yes } => {
             let vault = vault_dir(&cli, &cfg)?;
             let m = read_meta(&vault, name)?;
-            if game_running() && !force {
-                bail!("The game appears to be running. Exit it first (or use --force)");
+            if game_running() {
+                bail!("The game is running. Loading a snapshot is only possible while the game is closed.");
             }
             let live = resolve_live(&cli, &cfg)?;
             let (n, l) = fmt_char(&m.character);

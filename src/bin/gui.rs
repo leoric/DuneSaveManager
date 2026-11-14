@@ -2,13 +2,14 @@
 
 use dune_save_manager::*;
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Vec2};
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const SAND: Color32 = Color32::from_rgb(224, 164, 88);
@@ -34,6 +35,57 @@ fn char_label(m: &Meta) -> String {
 /// Default window width: left panel and margins (362) + exactly two cards (2 x 292) + their gap (10),
 /// plus ~2 px of slack for rounding on scaled displays. Narrower windows fall back to one column.
 const DEFAULT_WIDTH: f32 = 958.0;
+
+/// Default window height: chrome (95) + exactly two card rows (2 x 233 + 10 gap) + ~2 px slack.
+/// The character tab row (shown when there is more than one character) adds 23.
+const DEFAULT_HEIGHT: f32 = 95.0 + 476.0 + 2.0;
+const TABS_ROW: f32 = 23.0;
+
+fn default_height() -> f32 {
+    let cfg = load_config();
+    let mut names: Vec<String> = vec![];
+    if let Ok(v) = vault_dir(&None, &cfg) {
+        for m in all_meta(&v).iter().filter(|m| !m.name.starts_with("_auto-")) {
+            let n = char_label(m);
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    DEFAULT_HEIGHT + if names.len() > 1 { TABS_ROW } else { 0.0 }
+}
+
+/// Window geometry remembered between runs (config folder / window.json).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
+struct WindowState {
+    x: Option<f32>,
+    y: Option<f32>,
+    w: f32,
+    h: f32,
+    maximized: bool,
+}
+
+fn window_state_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("DuneSaveManager").join("window.json"))
+}
+
+fn load_window_state() -> Option<WindowState> {
+    let w: WindowState = serde_json::from_str(&std::fs::read_to_string(window_state_path()?).ok()?).ok()?;
+    // Ignore obviously bogus values (e.g. a minimized window parked at -32000).
+    let sane_pos = |v: Option<f32>| v.map_or(true, |v| (-4000.0..=9000.0).contains(&v));
+    ((800.0..=8000.0).contains(&w.w) && (500.0..=6000.0).contains(&w.h) && sane_pos(w.x) && sane_pos(w.y)).then_some(w)
+}
+
+fn save_window_state(w: &WindowState) {
+    if let Some(p) = window_state_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        if let Ok(s) = serde_json::to_string_pretty(w) {
+            let _ = std::fs::write(p, s);
+        }
+    }
+}
 
 const THUMB: Vec2 = Vec2::new(280.0, 157.0);
 
@@ -88,6 +140,9 @@ struct App {
     job: Option<Job>,
     /// Selected character tab in the snapshots list (None = all characters).
     char_tab: Option<String>,
+    win: Option<WindowState>,
+    win_written: Option<WindowState>,
+    win_last_write: Instant,
     log_edit: String,
     log_found: Option<PathBuf>,
     // cached so Settings doesn't hit the disk every frame
@@ -131,6 +186,9 @@ impl App {
             thumbs: Default::default(),
             job: None,
             char_tab: None,
+            win: None,
+            win_written: None,
+            win_last_write: Instant::now(),
             log_found: None,
             running: Arc::new(AtomicBool::new(false)),
             cands: vec![],
@@ -190,6 +248,41 @@ impl App {
 
     fn live_path(&self) -> Option<PathBuf> {
         self.live.as_ref().ok().cloned()
+    }
+
+    /// Remember the window's normal (not minimized / maximized) size and position; written at most once a second
+    /// while it changes, and always on exit.
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let (inner, outer, maxi, mini) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.outer_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false))
+        });
+        if mini {
+            return;
+        }
+        let mut w = self.win.clone().unwrap_or_default();
+        if !maxi {
+            if let Some(r) = inner {
+                w.w = r.width().round();
+                w.h = r.height().round();
+            }
+            if let Some(o) = outer {
+                w.x = Some(o.min.x.round());
+                w.y = Some(o.min.y.round());
+            }
+        }
+        w.maximized = maxi;
+        self.win = Some(w.clone());
+        if w.w >= 800.0 && w.h >= 500.0 && self.win_written.as_ref() != Some(&w) {
+            if self.win_last_write.elapsed() > Duration::from_secs(1) {
+                save_window_state(&w);
+                self.win_written = Some(w);
+                self.win_last_write = Instant::now();
+            } else {
+                // An idle app renders no frames; make sure one comes after the 1 s throttle so the change is saved.
+                ctx.request_repaint_after(Duration::from_millis(1100));
+            }
+        }
     }
 
     fn auto_name(&self) -> String {
@@ -359,9 +452,18 @@ fn img_uri(p: &Path) -> String {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(w) = &self.win {
+            if w.w >= 800.0 && w.h >= 500.0 {
+                save_window_state(w);
+            }
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         let running = self.running.load(Ordering::Relaxed);
         self.poll_job();
+        self.track_window(ctx);
 
         // ── top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -826,10 +928,20 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([DEFAULT_WIDTH, 740.0]).with_min_inner_size([800.0, 500.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default().with_min_inner_size([800.0, 500.0]);
+    match load_window_state() {
+        Some(w) => {
+            viewport = viewport.with_inner_size([w.w, w.h]);
+            if let (Some(x), Some(y)) = (w.x, w.y) {
+                viewport = viewport.with_position([x, y]);
+            }
+            if w.maximized {
+                viewport = viewport.with_maximized(true);
+            }
+        }
+        None => viewport = viewport.with_inner_size([DEFAULT_WIDTH, default_height()]),
+    }
+    let opts = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "Dune Solo Save Manager",
         opts,

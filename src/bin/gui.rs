@@ -27,6 +27,10 @@ fn note_icon(ui: &mut egui::Ui) -> egui::Response {
     resp
 }
 
+fn char_label(m: &Meta) -> String {
+    m.character.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Unknown".into())
+}
+
 const THUMB: Vec2 = Vec2::new(280.0, 157.0);
 
 #[derive(PartialEq, Clone, Copy)]
@@ -77,6 +81,8 @@ struct App {
     running: Arc<AtomicBool>,
     thumbs: std::collections::HashMap<String, PathBuf>,
     job: Option<Job>,
+    /// Selected character tab in the snapshots list (None = all characters).
+    char_tab: Option<String>,
     log_edit: String,
     log_found: Option<PathBuf>,
     // cached so Settings doesn't hit the disk every frame
@@ -119,6 +125,7 @@ impl App {
             probe_out: None,
             thumbs: Default::default(),
             job: None,
+            char_tab: None,
             log_found: None,
             running: Arc::new(AtomicBool::new(false)),
             cands: vec![],
@@ -490,7 +497,36 @@ impl eframe::App for App {
                 }
             });
             ui.separator();
-            let metas: Vec<&Meta> = self.metas.iter().filter(|m| self.show_auto || !m.name.starts_with("_auto-")).collect();
+            let visible: Vec<&Meta> = self.metas.iter().filter(|m| self.show_auto || !m.name.starts_with("_auto-")).collect();
+            // Character tabs, only when the vault holds more than one character (most recently saved first).
+            let mut names: Vec<String> = vec![];
+            for m in &visible {
+                let n = char_label(m);
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+            if names.len() > 1 {
+                if self.char_tab.as_ref().map_or(false, |t| !names.contains(t)) {
+                    self.char_tab = None;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.selectable_label(self.char_tab.is_none(), format!("All ({})", visible.len())).clicked() {
+                        self.char_tab = None;
+                    }
+                    for n in &names {
+                        let count = visible.iter().filter(|m| &char_label(m) == n).count();
+                        let sel = self.char_tab.as_ref() == Some(n);
+                        if ui.selectable_label(sel, format!("{n} ({count})")).clicked() {
+                            self.char_tab = Some(n.clone());
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+            } else {
+                self.char_tab = None;
+            }
+            let metas: Vec<&Meta> = visible.into_iter().filter(|m| self.char_tab.as_ref().map_or(true, |t| &char_label(m) == t)).collect();
             if metas.is_empty() {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| ui.weak("No snapshots yet. Name your current character on the left and press Save."));
@@ -532,7 +568,8 @@ impl eframe::App for App {
                                 ui.add(egui::Label::new(job).truncate(true)).on_hover_text(format!("{n}, level {l}\nSaved {}  ({})", m.created, mb(m.bytes)));
                                 // line 3: buttons + note icon
                                 ui.horizontal(|ui| {
-                                    if ui.add_enabled(!running, egui::Button::new("Load")).on_disabled_hover_text("Close the game first").clicked() {
+                                    let load_btn = egui::Button::new(RichText::new("Load").strong().color(Color32::WHITE)).fill(Color32::from_rgb(40, 130, 85)).min_size(Vec2::new(54.0, 0.0));
+                                    if ui.add_enabled(!running, load_btn).on_disabled_hover_text("Close the game first").clicked() {
                                         load = Some(m.name.clone());
                                     }
                                     if ui.button("Screenshot").clicked() {

@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf};
 // ───────────────────────── CLI ─────────────────────────
 
 #[derive(Parser)]
-#[command(name = "DuneSaveManager", version, about = "Save + character manager for Dune: Awakening solo mode")]
+#[command(name = "DuneSaveManagerCLI", version, about = "Save + character manager for Dune: Awakening solo mode")]
 struct Cli {
     /// Use this save location for this run (the <steamid> folder containing game.db, or its FLS_retail parent)
     #[arg(long, global = true)]

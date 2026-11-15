@@ -4,8 +4,8 @@ Save + character manager for **Dune: Awakening solo mode** (patch 1.5+). Written
 
 Two programs are built from this project:
 
-* **`DuneSaveManager-gui`**: the graphical app (start here, double-click it).
-* `DuneSaveManager`: the same features as a command line tool (documented below).
+* **`DuneSaveManager`**: the graphical app (start here, double-click it).
+* `DuneSaveManagerCLI`: the same features as a command line tool (documented below).
 
 ## GUI
 
@@ -24,7 +24,7 @@ as many solo characters as you like and never lose one to a bad update or corrup
 ## Getting the Windows .exe
 
 Easiest: double-click **`build-windows.bat`**. It installs Rust if needed and builds
-`target\release\DuneSaveManager-gui.exe` (first build takes a few minutes).
+`target\release\DuneSaveManager.exe` (first build takes a few minutes).
 If it complains about a linker, install "Build Tools for Visual Studio" (workload: Desktop development with C++).
 
 No local tooling at all: push this folder to a GitHub repo, open the **Actions** tab, run
@@ -34,7 +34,7 @@ No local tooling at all: push this folder to a GitHub repo, open the **Actions**
 
 1. Install Rust: https://rustup.rs  (on Windows it also asks for the MSVC "C++ build tools"; accept that)
 2. `cargo build --release`
-3. Binaries: `target/release/DuneSaveManager-gui(.exe)` and `DuneSaveManager(.exe)`
+3. Binaries: `target/release/DuneSaveManager(.exe)` (GUI) and `DuneSaveManagerCLI(.exe)` (command line)
 
 Linux note: the GUI is built for X11 (works under Wayland via XWayland).
 
@@ -43,12 +43,12 @@ SQLite is bundled, nothing else to install.
 ## Command line quick start
 
 ```
-DuneSaveManager detect                      # find your save folder (Steam default)
-DuneSaveManager status                      # who is in the live save right now?
-DuneSaveManager save atreides-run -n "pre-Arrakeen"
-DuneSaveManager list
-DuneSaveManager load harkonnen              # live save is auto-backed-up first
-DuneSaveManager gallery --open              # HTML page with screenshots
+DuneSaveManagerCLI detect                      # find your save folder (Steam default)
+DuneSaveManagerCLI status                      # who is in the live save right now?
+DuneSaveManagerCLI save atreides-run -n "pre-Arrakeen"
+DuneSaveManagerCLI list
+DuneSaveManagerCLI load harkonnen              # live save is auto-backed-up first
+DuneSaveManagerCLI gallery --open              # HTML page with screenshots
 ```
 
 **Saving while the game runs is supported.** The game writes `game.db` every 60 s and logs
@@ -68,10 +68,10 @@ Auto-detected: Windows Steam, and Steam/Proton on Linux/Steam Deck (all Steam li
 Anything else (Game Pass, custom location):
 
 ```
-DuneSaveManager config saves "D:\path\to\FLS_retail"   # or the <steamid> folder itself
-DuneSaveManager config profile 7656119xxxxxxxxxx       # if several <steamid> folders exist
-DuneSaveManager config vault "E:\DuneBackups"
-DuneSaveManager config show
+DuneSaveManagerCLI config saves "D:\path\to\FLS_retail"   # or the <steamid> folder itself
+DuneSaveManagerCLI config profile 7656119xxxxxxxxxx       # if several <steamid> folders exist
+DuneSaveManagerCLI config vault "E:\DuneBackups"
+DuneSaveManagerCLI config show
 ```
 Per-run overrides: `--saves <path>` and `--vault <path>`.
 
@@ -93,9 +93,9 @@ The solo DB layout isn't officially documented, so name/level are found heuristi
 which column each value came from. If it's wrong or missing:
 
 ```
-DuneSaveManager probe                       # lists candidate columns with sample values
-DuneSaveManager config name-sql  "SELECT col FROM tbl WHERE ... LIMIT 1"
-DuneSaveManager config level-sql "SELECT col FROM tbl WHERE ... LIMIT 1"
+DuneSaveManagerCLI probe                       # lists candidate columns with sample values
+DuneSaveManagerCLI config name-sql  "SELECT col FROM tbl WHERE ... LIMIT 1"
+DuneSaveManagerCLI config level-sql "SELECT col FROM tbl WHERE ... LIMIT 1"
 ```
 
 ## Steam Cloud warning

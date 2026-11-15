@@ -16,5 +16,5 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Done: target\release\DuneSaveManager-gui.exe
+echo Done: target\release\DuneSaveManager.exe
 pause

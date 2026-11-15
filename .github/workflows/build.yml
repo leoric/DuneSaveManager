@@ -14,5 +14,5 @@ jobs:
         with:
           name: DuneSaveManager-windows
           path: |
-            target/release/DuneSaveManager-gui.exe
             target/release/DuneSaveManager.exe
+            target/release/DuneSaveManagerCLI.exe

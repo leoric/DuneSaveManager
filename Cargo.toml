@@ -25,11 +25,11 @@ name = "dune_save_manager"
 path = "src/lib.rs"
 
 [[bin]]
-name = "DuneSaveManager"
+name = "DuneSaveManagerCLI"
 path = "src/main.rs"
 
 [[bin]]
-name = "DuneSaveManager-gui"
+name = "DuneSaveManager"
 path = "src/bin/gui.rs"
 
 [profile.release]

@@ -19,19 +19,28 @@ const SAND: Color32 = Color32::from_rgb(224, 164, 88);
 fn note_icon(ui: &mut egui::Ui) -> egui::Response {
     let size = Vec2::splat(ui.spacing().interact_size.y);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    let color = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+    let color = if resp.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
     let r = rect.shrink(size.x * 0.2);
     let stroke = egui::Stroke::new(1.5_f32, color);
     for i in 0..4 {
         let y = r.top() + r.height() * (i as f32 / 3.0);
         let x2 = if i == 3 { r.center().x } else { r.right() };
-        ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(x2, y)], stroke);
+        ui.painter()
+            .line_segment([egui::pos2(r.left(), y), egui::pos2(x2, y)], stroke);
     }
     resp
 }
 
 fn char_label(m: &Meta) -> String {
-    m.character.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Unknown".into())
+    m.character
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Unknown".into())
 }
 
 /// Default window width: left panel and margins (362) + exactly two cards (2 x 292) + their gap (10),
@@ -47,7 +56,10 @@ fn default_height() -> f32 {
     let cfg = load_config();
     let mut names: Vec<String> = vec![];
     if let Ok(v) = vault_dir(&None, &cfg) {
-        for m in all_meta(&v).iter().filter(|m| !m.name.starts_with("_auto-")) {
+        for m in all_meta(&v)
+            .iter()
+            .filter(|m| !m.name.starts_with("_auto-"))
+        {
             let n = char_label(m);
             if !names.contains(&n) {
                 names.push(n);
@@ -72,10 +84,15 @@ fn window_state_path() -> Option<PathBuf> {
 }
 
 fn load_window_state() -> Option<WindowState> {
-    let w: WindowState = serde_json::from_str(&std::fs::read_to_string(window_state_path()?).ok()?).ok()?;
+    let w: WindowState =
+        serde_json::from_str(&std::fs::read_to_string(window_state_path()?).ok()?).ok()?;
     // Ignore obviously bogus values (e.g. a minimized window parked at -32000).
     let sane_pos = |v: Option<f32>| v.map_or(true, |v| (-4000.0..=9000.0).contains(&v));
-    ((800.0..=8000.0).contains(&w.w) && (500.0..=6000.0).contains(&w.h) && sane_pos(w.x) && sane_pos(w.y)).then_some(w)
+    ((800.0..=8000.0).contains(&w.w)
+        && (500.0..=6000.0).contains(&w.h)
+        && sane_pos(w.x)
+        && sane_pos(w.y))
+    .then_some(w)
 }
 
 fn save_window_state(w: &WindowState) {
@@ -162,12 +179,24 @@ impl App {
     fn new() -> Self {
         let cfg = load_config();
         let mut a = App {
-            saves_edit: cfg.saves_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            vault_edit: cfg.vault.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            saves_edit: cfg
+                .saves_root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            vault_edit: cfg
+                .vault
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             shots_edit: String::new(),
             name_sql: cfg.name_sql.clone().unwrap_or_default(),
             level_sql: cfg.level_sql.clone().unwrap_or_default(),
-            log_edit: cfg.log_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            log_edit: cfg
+                .log_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             cfg,
             live: Err("not loaded".into()),
             info: None,
@@ -257,7 +286,12 @@ impl App {
     fn track_window(&mut self, ctx: &egui::Context) {
         let (inner, outer, maxi, mini) = ctx.input(|i| {
             let v = i.viewport();
-            (v.inner_rect, v.outer_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false))
+            (
+                v.inner_rect,
+                v.outer_rect,
+                v.maximized.unwrap_or(false),
+                v.minimized.unwrap_or(false),
+            )
         });
         if mini {
             return;
@@ -288,12 +322,19 @@ impl App {
     }
 
     fn auto_name(&self) -> String {
-        suggest_name(&self.vault, self.info.as_ref().and_then(|i| i.name.as_deref()))
+        suggest_name(
+            &self.vault,
+            self.info.as_ref().and_then(|i| i.name.as_deref()),
+        )
     }
 
     fn do_save(&mut self, ctx: &egui::Context) {
         let typed = self.new_name.trim().to_string();
-        let name = if typed.is_empty() { self.auto_name() } else { typed };
+        let name = if typed.is_empty() {
+            self.auto_name()
+        } else {
+            typed
+        };
         if !valid_name(&name) {
             return self.say("Name may only contain letters, digits, spaces, . _ -", true);
         }
@@ -305,7 +346,11 @@ impl App {
         };
         let (cfg, vault) = (self.cfg.clone(), self.vault.clone());
         let note = Some(self.new_note.trim().to_string()).filter(|s| !s.is_empty());
-        let (mode, max_age, shot_file) = (self.shot_mode, self.max_age, PathBuf::from(self.shot_file.trim()));
+        let (mode, max_age, shot_file) = (
+            self.shot_mode,
+            self.max_age,
+            PathBuf::from(self.shot_file.trim()),
+        );
         let (tx, rx) = mpsc::channel::<Msg>();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -327,14 +372,19 @@ impl App {
                 say(format!("{w} - using the newest Steam screenshot instead."));
             }
             let mut progress = |s: String| say(s);
-            let res = safe_snapshot(&vault, &name, &live, &cfg, note, shot, true, &mut progress).map_err(|e| e.to_string());
+            let res = safe_snapshot(&vault, &name, &live, &cfg, note, shot, true, &mut progress)
+                .map_err(|e| e.to_string());
             if let Some(t) = tmp {
                 let _ = std::fs::remove_file(t);
             }
             let _ = tx.send(Msg::Done(res));
             ctx2.request_repaint();
         });
-        self.job = Some(Job { rx, status: "Starting…".into(), warn: None });
+        self.job = Some(Job {
+            rx,
+            status: "Starting…".into(),
+            warn: None,
+        });
     }
 
     fn poll_job(&mut self) {
@@ -376,7 +426,10 @@ impl App {
         match p {
             Pending::Load(name) => {
                 if game_running() {
-                    return self.say("The game is running. Exit it before loading a character.", true);
+                    return self.say(
+                        "The game is running. Exit it before loading a character.",
+                        true,
+                    );
                 }
                 let Some(live) = self.live_path() else {
                     return self.say("No live save found.", true);
@@ -437,7 +490,11 @@ impl App {
     }
 
     fn profile_choices(&self) -> Vec<String> {
-        let root = self.cfg.saves_root.clone().or_else(|| fls_candidates().into_iter().next());
+        let root = self
+            .cfg
+            .saves_root
+            .clone()
+            .or_else(|| fls_candidates().into_iter().next());
         match root {
             Some(r) if !r.join("game.db").exists() => subdirs(&r)
                 .into_iter()
@@ -480,7 +537,10 @@ impl eframe::App for App {
                         self.refresh();
                     }
                     let (c, t) = if running {
-                        (Color32::from_rgb(220, 150, 60), "Game running - saving is timed to its DB save; loading is disabled")
+                        (
+                            Color32::from_rgb(220, 150, 60),
+                            "Game running - saving is timed to its DB save; loading is disabled",
+                        )
                     } else {
                         (Color32::from_rgb(90, 190, 110), "Game closed")
                     };
@@ -622,16 +682,32 @@ impl eframe::App for App {
                 if ui.small_button("Open vault folder").clicked() {
                     open_path(&self.vault);
                 }
-                let n_auto = self.metas.iter().filter(|m| m.name.starts_with("_auto-")).count();
-                let del_btn = egui::Button::new(RichText::new(format!("Delete autosaves ({n_auto})")).color(Color32::WHITE).size(12.0))
-                    .fill(Color32::from_rgb(176, 48, 48))
-                    .small();
-                if ui.add_enabled(n_auto > 0, del_btn).on_disabled_hover_text("There are no automatic backups").clicked() {
+                let n_auto = self
+                    .metas
+                    .iter()
+                    .filter(|m| m.name.starts_with("_auto-"))
+                    .count();
+                let del_btn = egui::Button::new(
+                    RichText::new(format!("Delete autosaves ({n_auto})"))
+                        .color(Color32::WHITE)
+                        .size(12.0),
+                )
+                .fill(Color32::from_rgb(176, 48, 48))
+                .small();
+                if ui
+                    .add_enabled(n_auto > 0, del_btn)
+                    .on_disabled_hover_text("There are no automatic backups")
+                    .clicked()
+                {
                     del_autos = true;
                 }
             });
             ui.separator();
-            let visible: Vec<&Meta> = self.metas.iter().filter(|m| self.show_auto || !m.name.starts_with("_auto-")).collect();
+            let visible: Vec<&Meta> = self
+                .metas
+                .iter()
+                .filter(|m| self.show_auto || !m.name.starts_with("_auto-"))
+                .collect();
             // Character tabs, only when the vault holds more than one character (most recently saved first).
             let mut names: Vec<String> = vec![];
             for m in &visible {
@@ -645,7 +721,13 @@ impl eframe::App for App {
                     self.char_tab = None;
                 }
                 ui.horizontal_wrapped(|ui| {
-                    if ui.selectable_label(self.char_tab.is_none(), format!("All ({})", visible.len())).clicked() {
+                    if ui
+                        .selectable_label(
+                            self.char_tab.is_none(),
+                            format!("All ({})", visible.len()),
+                        )
+                        .clicked()
+                    {
                         self.char_tab = None;
                     }
                     for n in &names {
@@ -660,73 +742,154 @@ impl eframe::App for App {
             } else {
                 self.char_tab = None;
             }
-            let metas: Vec<&Meta> = visible.into_iter().filter(|m| self.char_tab.as_ref().map_or(true, |t| &char_label(m) == t)).collect();
+            let metas: Vec<&Meta> = visible
+                .into_iter()
+                .filter(|m| self.char_tab.as_ref().map_or(true, |t| &char_label(m) == t))
+                .collect();
             if metas.is_empty() {
                 ui.add_space(40.0);
-                ui.vertical_centered(|ui| ui.weak("No snapshots yet. Name your current character on the left and press Save."));
+                ui.vertical_centered(|ui| {
+                    ui.weak(
+                        "No snapshots yet. Name your current character on the left and press Save.",
+                    )
+                });
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                // Cards have a fixed width; work out how many fit per row and lay them out row by row
-                // (egui's wrapped layout does not wrap nested frames, so everything ended up in one row).
-                let frame = egui::Frame::group(ui.style());
-                let card_w = THUMB.x + frame.total_margin().sum().x;
-                let gap = 10.0;
-                ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
-                let cols = (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
-                for row in metas.chunks(cols) {
-                    ui.horizontal_top(|ui| {
-                        for m in row {
-                            frame.show(ui, |ui| {
-                              ui.vertical(|ui| {
-                                ui.set_width(THUMB.x);
-                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-                                match &m.screenshot {
-                                    Some(s) => {
-                                        let shown = self.thumbs.get(&m.name).cloned().unwrap_or_else(|| self.vault.join(&m.name).join(s));
-                                        ui.add(egui::Image::new(img_uri(&shown)).fit_to_exact_size(THUMB).rounding(4.0));
-                                    }
-                                    None => {
-                                        let (rect, _) = ui.allocate_exact_size(THUMB, Sense::hover());
-                                        ui.painter().rect_filled(rect, 4.0, Color32::from_gray(24));
-                                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "no screenshot", FontId::proportional(13.0), Color32::GRAY);
-                                    }
-                                }
-                                // line 1: snapshot name
-                                ui.add(egui::Label::new(RichText::new(&m.name).strong().size(16.0)).truncate(true)).on_hover_text(&m.name);
-                                // line 2: character, level, date
-                                let n = m.character.name.clone().unwrap_or("Unknown".into());
-                                let l = m.character.level.map(|x| x.to_string()).unwrap_or("?".into());
-                                let mut job = egui::text::LayoutJob::default();
-                                job.append(&format!("{n}  ·  Lv {l}"), 0.0, egui::text::TextFormat { font_id: FontId::proportional(14.0), color: SAND, ..Default::default() });
-                                job.append(&format!("  ·  {}", m.created), 0.0, egui::text::TextFormat { font_id: FontId::proportional(13.0), color: Color32::GRAY, ..Default::default() });
-                                ui.add(egui::Label::new(job).truncate(true)).on_hover_text(format!("{n}, level {l}\nSaved {}  ({})", m.created, mb(m.bytes)));
-                                // line 3: buttons + note icon
-                                ui.horizontal(|ui| {
-                                    let load_btn = egui::Button::new(RichText::new("Load").strong().color(Color32::WHITE)).fill(Color32::from_rgb(40, 130, 85)).min_size(Vec2::new(54.0, 0.0));
-                                    if ui.add_enabled(!running, load_btn).on_disabled_hover_text("Close the game first").clicked() {
-                                        load = Some(m.name.clone());
-                                    }
-                                    if ui.button("Screenshot").clicked() {
-                                        attach = Some(m.name.clone());
-                                    }
-                                    if ui.button("Delete").clicked() {
-                                        del = Some(m.name.clone());
-                                    }
-                                    if let Some(note) = m.note.as_ref().filter(|t| !t.trim().is_empty()) {
-                                        // Hovering the glyph shows the note itself (long notes are wrapped and capped).
-                                        let text: String = if note.chars().count() > 1500 { note.chars().take(1500).collect::<String>() + "…" } else { note.clone() };
-                                        note_icon(ui).on_hover_ui(|ui| {
-                                            ui.set_max_width(360.0);
-                                            ui.label(text);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Cards have a fixed width; work out how many fit per row and lay them out row by row
+                    // (egui's wrapped layout does not wrap nested frames, so everything ended up in one row).
+                    let frame = egui::Frame::group(ui.style());
+                    let card_w = THUMB.x + frame.total_margin().sum().x;
+                    let gap = 10.0;
+                    ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                    let cols =
+                        (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
+                    for row in metas.chunks(cols) {
+                        ui.horizontal_top(|ui| {
+                            for m in row {
+                                frame.show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(THUMB.x);
+                                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                                        match &m.screenshot {
+                                            Some(s) => {
+                                                let shown = self
+                                                    .thumbs
+                                                    .get(&m.name)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| {
+                                                        self.vault.join(&m.name).join(s)
+                                                    });
+                                                ui.add(
+                                                    egui::Image::new(img_uri(&shown))
+                                                        .fit_to_exact_size(THUMB)
+                                                        .rounding(4.0),
+                                                );
+                                            }
+                                            None => {
+                                                let (rect, _) =
+                                                    ui.allocate_exact_size(THUMB, Sense::hover());
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    4.0,
+                                                    Color32::from_gray(24),
+                                                );
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    Align2::CENTER_CENTER,
+                                                    "no screenshot",
+                                                    FontId::proportional(13.0),
+                                                    Color32::GRAY,
+                                                );
+                                            }
+                                        }
+                                        // line 1: snapshot name
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&m.name).strong().size(16.0),
+                                            )
+                                            .truncate(true),
+                                        )
+                                        .on_hover_text(&m.name);
+                                        // line 2: character, level, date
+                                        let n =
+                                            m.character.name.clone().unwrap_or("Unknown".into());
+                                        let l = m
+                                            .character
+                                            .level
+                                            .map(|x| x.to_string())
+                                            .unwrap_or("?".into());
+                                        let mut job = egui::text::LayoutJob::default();
+                                        job.append(
+                                            &format!("{n}  ·  Lv {l}"),
+                                            0.0,
+                                            egui::text::TextFormat {
+                                                font_id: FontId::proportional(14.0),
+                                                color: SAND,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.append(
+                                            &format!("  ·  {}", m.created),
+                                            0.0,
+                                            egui::text::TextFormat {
+                                                font_id: FontId::proportional(13.0),
+                                                color: Color32::GRAY,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        ui.add(egui::Label::new(job).truncate(true)).on_hover_text(
+                                            format!(
+                                                "{n}, level {l}\nSaved {}  ({})",
+                                                m.created,
+                                                mb(m.bytes)
+                                            ),
+                                        );
+                                        // line 3: buttons + note icon
+                                        ui.horizontal(|ui| {
+                                            let load_btn = egui::Button::new(
+                                                RichText::new("Load")
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .fill(Color32::from_rgb(40, 130, 85))
+                                            .min_size(Vec2::new(54.0, 0.0));
+                                            if ui
+                                                .add_enabled(!running, load_btn)
+                                                .on_disabled_hover_text("Close the game first")
+                                                .clicked()
+                                            {
+                                                load = Some(m.name.clone());
+                                            }
+                                            if ui.button("Screenshot").clicked() {
+                                                attach = Some(m.name.clone());
+                                            }
+                                            if ui.button("Delete").clicked() {
+                                                del = Some(m.name.clone());
+                                            }
+                                            if let Some(note) =
+                                                m.note.as_ref().filter(|t| !t.trim().is_empty())
+                                            {
+                                                // Hovering the glyph shows the note itself (long notes are wrapped and capped).
+                                                let text: String = if note.chars().count() > 1500 {
+                                                    note.chars().take(1500).collect::<String>()
+                                                        + "…"
+                                                } else {
+                                                    note.clone()
+                                                };
+                                                note_icon(ui).on_hover_ui(|ui| {
+                                                    ui.set_max_width(360.0);
+                                                    ui.label(text);
+                                                });
+                                            }
                                         });
-                                    }
+                                    });
                                 });
-                              });
-                            });
-                        }
-                    });
-                }
-            });
+                            }
+                        });
+                    }
+                });
         });
         if let Some(n) = load {
             self.pending = Some(Pending::Load(n));
@@ -752,17 +915,21 @@ impl eframe::App for App {
                     self.metas.iter().filter(|m| m.name.starts_with("_auto-")).count()
                 ),
             };
-            egui::Window::new("Confirm").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label(text);
-                ui.horizontal(|ui| {
-                    if ui.button("Yes").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
+            egui::Window::new("Confirm")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(text);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            decision = Some(false);
+                        }
+                    });
                 });
-            });
         }
         match decision {
             Some(true) => self.do_pending(ctx),
@@ -775,26 +942,31 @@ impl eframe::App for App {
         let mut apply_attach: Option<(String, PathBuf)> = None;
         let mut newest: Option<String> = None;
         if let Some((name, path)) = &mut self.attach_for {
-            egui::Window::new(format!("Screenshot for '{name}'")).collapsible(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label("Path to an image (png/jpg/bmp/webp):");
-                ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
-                ui.horizontal(|ui| {
-                    if ui.button("Use newest Steam screenshot (7 days)").clicked() {
-                        newest = Some(name.clone());
-                    }
+            egui::Window::new(format!("Screenshot for '{name}'"))
+                .collapsible(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Path to an image (png/jpg/bmp/webp):");
+                    ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                    ui.horizontal(|ui| {
+                        if ui.button("Use newest Steam screenshot (7 days)").clicked() {
+                            newest = Some(name.clone());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Attach").clicked() {
+                            apply_attach = Some((name.clone(), PathBuf::from(path.trim())));
+                        }
+                        if ui.button("Close").clicked() {
+                            close_attach = true;
+                        }
+                    });
                 });
-                ui.horizontal(|ui| {
-                    if ui.button("Attach").clicked() {
-                        apply_attach = Some((name.clone(), PathBuf::from(path.trim())));
-                    }
-                    if ui.button("Close").clicked() {
-                        close_attach = true;
-                    }
-                });
-            });
         }
         if let Some(name) = newest {
-            let found = self.live_path().and_then(|l| newest_screenshot(&l, &self.cfg, 24 * 7));
+            let found = self
+                .live_path()
+                .and_then(|l| newest_screenshot(&l, &self.cfg, 24 * 7));
             match found {
                 Some(f) => apply_attach = Some((name, f)),
                 None => self.say("No screenshot from the last 7 days found.", true),
@@ -952,7 +1124,9 @@ fn claim_instance() -> Instance {
                 let _ = s.set_read_timeout(Some(timeout));
                 let _ = s.set_write_timeout(Some(timeout));
                 let mut buf = [0u8; 8];
-                if s.write_all(SHOW_MSG).is_ok() && s.read(&mut buf).map_or(false, |n| &buf[..n] == SHOW_ACK) {
+                if s.write_all(SHOW_MSG).is_ok()
+                    && s.read(&mut buf).map_or(false, |n| &buf[..n] == SHOW_ACK)
+                {
                     return Instance::Existing;
                 }
             }
@@ -1003,11 +1177,18 @@ fn main() -> eframe::Result<()> {
         }
         None => viewport = viewport.with_inner_size([DEFAULT_WIDTH, default_height()]),
     }
-    let opts = eframe::NativeOptions { viewport, ..Default::default() };
+    let opts = eframe::NativeOptions {
+        viewport,
+        // Always use the dark theme, regardless of the Windows light/dark setting.
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Dark,
+        ..Default::default()
+    };
     eframe::run_native(
         "Dune Solo Save Manager",
         opts,
         Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let app = App::new();
             app.start_watcher(cc.egui_ctx.clone());

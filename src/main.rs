@@ -168,7 +168,7 @@ fn run() -> Res<()> {
                 }
                 ConfigCmd::NameSql { sql } => cfg.name_sql = Some(sql.clone()).filter(|s| !s.is_empty()),
                 ConfigCmd::LevelSql { sql } => cfg.level_sql = Some(sql.clone()).filter(|s| !s.is_empty()),
-                ConfigCmd::Reset => cfg = Config::default(),
+                ConfigCmd::Reset => cfg = Config { ui: cfg.ui.clone(), window: cfg.window.clone(), ..Config::default() },
             }
             save_config(&cfg)?;
             println!("saved.");

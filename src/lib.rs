@@ -31,6 +31,35 @@ pub const IMG_EXT: [&str; 5] = ["png", "jpg", "jpeg", "bmp", "webp"];
 
 // ───────────────────────── config ─────────────────────────
 
+/// Theme choice for the GUI: follow the OS, or force dark / light.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePref {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+/// `[ui]` table of settings.toml.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub theme: ThemePref,
+}
+
+/// `[window]` table of settings.toml: GUI window geometry remembered between runs.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+pub struct WindowState {
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+/// All settings live in one file: `<config dir>/DuneSaveManager/settings.toml`.
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Config {
     pub saves_root: Option<PathBuf>,
@@ -43,24 +72,96 @@ pub struct Config {
     /// Game log file (or its folder). Blank = auto-detect `Saved/Logs/DuneSandbox.log`.
     #[serde(default)]
     pub log_path: Option<PathBuf>,
+    // Tables go last (TOML wants plain values before tables).
+    #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub window: Option<WindowState>,
+}
+
+const CONFIG_FILE: &str = "settings.toml";
+const CONFIG_HEADER: &str = "# DuneSaveManager settings (shared by the GUI and the CLI).\n\n";
+
+fn config_dir() -> Res<PathBuf> {
+    Ok(dirs::config_dir().ok_or("no config dir")?.join("DuneSaveManager"))
 }
 
 pub fn config_path() -> Res<PathBuf> {
-    Ok(dirs::config_dir().ok_or("no config dir")?.join("DuneSaveManager").join("config.json"))
+    Ok(config_dir()?.join(CONFIG_FILE))
 }
+
+/// Loads settings.toml. If it does not exist yet but settings from an older version do (config.json, window.json,
+/// and ui.json from v1.0.2 pre-releases), they are migrated into it first, silently.
 pub fn load_config() -> Config {
-    config_path()
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Ok(dir) = config_dir() else { return Config::default() };
+    migrate_legacy_config(&dir);
+    fs::read_to_string(dir.join(CONFIG_FILE)).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
 }
+
+/// Writes the whole config (atomically: temp file + rename).
 pub fn save_config(c: &Config) -> Res<()> {
     let p = config_path()?;
     fs::create_dir_all(p.parent().unwrap())?;
-    fs::write(p, serde_json::to_string_pretty(c)?)?;
+    let tmp = p.with_extension("toml.tmp");
+    fs::write(&tmp, format!("{CONFIG_HEADER}{}", toml::to_string_pretty(c)?))?;
+    fs::rename(&tmp, &p)?;
     Ok(())
 }
+
+/// Read-modify-write on the file as it is on disk, so independent writers (the settings form, the window tracker,
+/// the theme switch, the CLI) don't overwrite each other's parts with stale copies.
+pub fn update_config(f: impl FnOnce(&mut Config)) -> Res<()> {
+    let mut c = load_config();
+    f(&mut c);
+    save_config(&c)
+}
+
+/// One-time migration from the old JSON files (v1.0.0: config.json + window.json; v1.0.2 pre-releases: ui.json).
+/// Runs only when settings.toml is absent. Migrated files are renamed to `*.json.migrated` (kept as a backup, and
+/// so the migration never runs twice). A legacy file that can't be parsed is skipped and left untouched.
+/// Returns true if settings.toml was created.
+pub fn migrate_legacy_config(dir: &Path) -> bool {
+    let target = dir.join(CONFIG_FILE);
+    if target.exists() {
+        return false;
+    }
+    fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
+        serde_json::from_str(&fs::read_to_string(p).ok()?).ok()
+    }
+    #[derive(Deserialize)]
+    struct LegacyUi {
+        #[serde(default)]
+        theme: ThemePref,
+    }
+    let (f_cfg, f_win, f_ui) = (dir.join("config.json"), dir.join("window.json"), dir.join("ui.json"));
+    let cfg_old: Option<Config> = read(&f_cfg);
+    let win_old: Option<WindowState> = read(&f_win);
+    let ui_old: Option<LegacyUi> = read(&f_ui);
+    if cfg_old.is_none() && win_old.is_none() && ui_old.is_none() {
+        return false;
+    }
+    let mut cfg = cfg_old.clone().unwrap_or_default();
+    cfg.window = win_old.clone();
+    if let Some(u) = &ui_old {
+        cfg.ui.theme = u.theme;
+    }
+    let tmp = target.with_extension("toml.tmp");
+    let written = toml::to_string_pretty(&cfg)
+        .ok()
+        .and_then(|t| fs::write(&tmp, format!("{CONFIG_HEADER}{t}")).ok())
+        .and_then(|_| fs::rename(&tmp, &target).ok());
+    if written.is_none() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    for (parsed, f) in [(cfg_old.is_some(), f_cfg), (win_old.is_some(), f_win), (ui_old.is_some(), f_ui)] {
+        if parsed {
+            let _ = fs::rename(&f, f.with_extension("json.migrated"));
+        }
+    }
+    true
+}
+
 pub fn vault_dir(vault: &Option<PathBuf>, cfg: &Config) -> Res<PathBuf> {
     let v = vault
         .clone()
